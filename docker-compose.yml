@@ -123,7 +123,7 @@ services:
 
     environment:
       MCP_GATEWAY_AUTH_TOKEN: ${MCP_GATEWAY_AUTH_TOKEN}
-      MCP_GATEWAY_DOCKER_BIND_ALLOWED_PATHS: "/opt/docker/compose/mcp/model-council-data"
+      MCP_GATEWAY_DOCKER_BIND_ALLOWED_PATHS: "/opt/docker/compose/mcp/model-council-data:/opt/projects:/opt/docker/compose"
       MCP_GATEWAY_DOCKER_BIND_ALLOW_WRITABLE_PATHS: "/opt/docker/compose/mcp/chroma-data:/opt/docker/compose/mcp/chroma-cache:/opt/docker/compose/mcp/onionclaw-data"
 
     volumes:

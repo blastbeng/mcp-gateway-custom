@@ -100,5 +100,7 @@ registry:
 
     volumes:
       - "/opt/docker/compose/mcp/model-council-data:/config:ro"
+      - "/opt/projects:/opt/projects:ro"
+      - "/opt/docker/compose:/opt/docker/compose:ro"
 
     longLived: true
