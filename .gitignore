@@ -1,14 +1,37 @@
-.aider*
+# ============================================================
+# Secrets — NEVER commit these
+# ============================================================
 .env
+model-council-data/config.json   # real council config (contains LiteLLM API key)
 
-# Secrets: real council config (contains API keys) - ship config.example.json instead
-model-council-data/config.json
-
-# Runtime data (databases, caches, vector stores)
+# ============================================================
+# Runtime data (databases, caches, vector stores, volumes)
+# ============================================================
 chroma-data/
 chroma-cache/
 onionclaw-data/
+*.db
+*.sqlite3
 
+# ============================================================
+# Aider / AiderDesk workspace artifacts
+# ============================================================
+.aider*
+.aider-desk/
+
+# ============================================================
 # Python artifacts
+# ============================================================
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ============================================================
+# Editors / OS
+# ============================================================
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
