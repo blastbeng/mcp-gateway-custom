@@ -1,0 +1,104 @@
+name: local-ai
+displayName: Local AI MCP Servers
+
+registry:
+
+  chroma:
+    type: server
+    image: mcp/chroma:latest
+    description: >
+      Local semantic vector memory for AiderDesk.
+      Stores and retrieves project documentation, architectural decisions,
+      technical knowledge and persistent project context using semantic search.
+
+    command:
+      - "chroma-mcp"
+      - "--client-type"
+      - "http"
+      - "--host"
+      - "chroma"
+      - "--port"
+      - "8000"
+      - "--ssl"
+      - "false"
+
+    volumes:
+      - "/opt/docker/compose/mcp/chroma-data:/data:rw"
+      - "/opt/docker/compose/mcp/chroma-cache:/root/.cache:rw"
+
+    longLived: true
+
+  searxng:
+    type: server
+    image: isokoliuk/mcp-searxng:latest
+    description: Local SearXNG web search MCP server.
+
+    env:
+      - name: SEARXNG_URL
+        value: http://searxng:8080
+
+  onionclaw:
+    title: OnionClaw / SICRY
+    type: server
+    image: onionclaw-mcp:latest
+
+    description: >
+      Tor and dark-web OSINT MCP server based on SICRY.
+      Searches multiple onion search engines, fetches onion URLs,
+      checks search-engine health, crawls onion sites and exports
+      structured OSINT data.
+
+    env:
+      - name: TOR_SOCKS_HOST
+        value: "torproxy"
+
+      - name: TOR_SOCKS_PORT
+        value: "9050"
+
+      - name: SICRY_DB_PATH
+        value: "/data/sicry.db"
+
+      - name: SICRY_MAX_CHARS
+        value: "12000"
+
+      - name: SICRY_SEARCH_CACHE_TTL
+        value: "1800"
+
+      - name: SICRY_ENGINE_CACHE_TTL
+        value: "3600"
+
+    volumes:
+      - "/opt/docker/compose/mcp/onionclaw-data:/data:rw"
+
+    longLived: true
+
+  context7:
+    title: Context7
+    type: remote
+    description: >
+      Up-to-date, version-specific documentation and code examples
+      for programming libraries and frameworks.
+    remote:
+      transport_type: streamable-http
+      url: https://mcp.context7.com/mcp
+
+    longLived: true
+
+  model-council:
+    title: Model Council
+    type: server
+    image: model-council-mcp:latest
+
+    description: >
+      Multi-model AI council using LiteLLM as an OpenAI-compatible
+      backend. Provides second opinions, code reviews, architecture
+      advice and multi-model synthesis.
+
+    env:
+      - name: COUNCIL_CONFIG
+        value: "/config/config.json"
+
+    volumes:
+      - "/opt/docker/compose/mcp/model-council-data:/config:ro"
+
+    longLived: true

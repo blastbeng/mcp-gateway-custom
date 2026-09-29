@@ -1,0 +1,14 @@
+.aider*
+.env
+
+# Secrets: real council config (contains API keys) - ship config.example.json instead
+model-council-data/config.json
+
+# Runtime data (databases, caches, vector stores)
+chroma-data/
+chroma-cache/
+onionclaw-data/
+
+# Python artifacts
+__pycache__/
+*.pyc

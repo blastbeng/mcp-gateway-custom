@@ -1,0 +1,22 @@
+use_default_settings:
+  engines:
+    remove:
+      - ahmia
+      - torch
+      - wikidata
+
+general:
+  instance_name: "Local SearXNG"
+
+server:
+  secret_key: "801a799f4d0298bd53cd7265eeaa7955a9748ba5a2b61ac62c28b963b4aba1f6"
+  bind_address: "0.0.0.0"
+  port: 8080
+
+search:
+  formats:
+    - html
+    - json
+
+limiter:
+  enabled: false

@@ -1,0 +1,241 @@
+services:
+
+  mcp-image-checker:
+    image: docker:cli
+    container_name: mcp-image-checker
+    restart: no
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./onionclaw:/opt/onionclaw:ro
+      - ./model-council:/opt/model-council:ro
+    environment:
+      CHECK_INTERVAL: "3600"
+    command:
+      - sh
+      - -c
+      - |
+        while true; do
+          echo "=== MCP image check: $$(date) ==="
+
+          for image in \
+            isokoliuk/mcp-searxng:latest \
+            mcp/fetch:latest \
+            mcp/chroma:latest \
+            ghcr.io/oraios/serena:latest
+          do
+            if docker image inspect "$$image" >/dev/null 2>&1; then
+              echo "OK: $$image"
+            else
+              echo "MISSING: $$image"
+              echo "Pulling $$image..."
+              docker pull "$$image" || echo "ERROR pulling $$image"
+            fi
+          done
+
+          echo "--- OnionClaw MCP ---"
+
+          if docker image inspect onionclaw-mcp:latest >/dev/null 2>&1; then
+            echo "OK: onionclaw-mcp:latest"
+          else
+            echo "MISSING: onionclaw-mcp:latest"
+            echo "Building onionclaw-mcp:latest..."
+
+            docker build \
+              --pull \
+              -t onionclaw-mcp:latest \
+              /opt/onionclaw \
+              || echo "ERROR building onionclaw-mcp:latest"
+          fi
+
+          echo "--- Model Council MCP ---"
+
+          if docker image inspect model-council-mcp:latest >/dev/null 2>&1; then
+            echo "OK: model-council-mcp:latest"
+          else
+            echo "MISSING: model-council-mcp:latest"
+            echo "Building model-council-mcp:latest..."
+
+            docker build \
+              --pull \
+              -t model-council-mcp:latest \
+              /opt/model-council \
+              || echo "ERROR building model-council-mcp:latest"
+          fi
+
+          echo "Next check in $${CHECK_INTERVAL}s"
+          sleep "$${CHECK_INTERVAL}"
+        done
+
+  torproxy:
+    image: dperson/torproxy:latest
+    container_name: torproxy
+    restart: no
+
+    environment:
+      TORUSER: root
+      TOR_LOG_LEVEL: err
+
+    ports:
+      - "0.0.0.0:9050:9050"
+      - "0.0.0.0:8118:8118"
+
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >
+          curl -fsS
+          --socks5-hostname 127.0.0.1:9050
+          https://check.torproject.org/api/ip
+          >/dev/null
+          || exit 1
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+    networks:
+      - mcp
+
+  mcp-gateway:
+    image: docker/mcp-gateway:latest
+    container_name: mcp-gateway
+    restart: "no"
+
+    command:
+      - --transport=streaming
+      - --port=8811
+      - --catalog=/root/.docker/mcp/catalogs/custom.yaml
+      - --servers=searxng
+      - --servers=fetch
+      - --servers=chroma
+      - --servers=onionclaw      
+      - --servers=context7
+      - --servers=model-council
+      - --verify-signatures=false
+      - --secrets=/root/.docker/mcp/.env
+
+    ports:
+      - "127.0.0.1:8813:8811"
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+
+    environment:
+      MCP_GATEWAY_AUTH_TOKEN: ${MCP_GATEWAY_AUTH_TOKEN}
+      MCP_GATEWAY_DOCKER_BIND_ALLOWED_PATHS: "/opt/docker/compose/mcp/model-council-data"
+      MCP_GATEWAY_DOCKER_BIND_ALLOW_WRITABLE_PATHS: "/opt/docker/compose/mcp/chroma-data:/opt/docker/compose/mcp/chroma-cache:/opt/docker/compose/mcp/onionclaw-data"
+
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./catalog:/root/.docker/mcp/catalogs:ro
+      - ./.env:/root/.docker/mcp/.env:ro
+
+    security_opt:
+      - no-new-privileges:true
+
+    networks:
+      - mcp
+
+
+  searxng:
+    image: docker.io/searxng/searxng:latest
+    container_name: searxng
+    restart: "no"
+
+    environment:
+      SEARXNG_SETTINGS_PATH: /etc/searxng/settings.yml
+
+    volumes:
+      - ./searxng:/etc/searxng:rw
+      - searxng-cache:/var/cache/searxng
+
+    ports:
+      - "127.0.0.1:8080:8080"
+
+    depends_on:
+      - valkey
+
+    networks:
+      - mcp
+
+
+  valkey:
+    image: docker.io/valkey/valkey:9-alpine
+    container_name: searxng-valkey
+    restart: "no"
+
+    command:
+      - valkey-server
+      - --save
+      - "30"
+      - "1"
+      - --loglevel
+      - warning
+
+    volumes:
+      - valkey-data:/data
+
+    security_opt:
+      - no-new-privileges:true
+
+    networks:
+      - mcp
+
+  chroma:
+    image: chromadb/chroma:latest
+    container_name: chroma
+    restart: no
+
+    volumes:
+      - ./chroma-data:/data
+
+    ports:
+      - "8000:8000"
+
+    networks:
+      - mcp
+
+  # Session-healing reverse proxy in front of the docker-mcp gateway.
+  # The gateway evicts idle in-memory MCP sessions (and loses them on
+  # restart); streamable-HTTP clients that cache Mcp-Session-Id then hit a
+  # permanent 404 "session not found". This proxy owns one upstream session,
+  # hands the client a STABLE id, and re-initializes transparently on 404.
+  mcp-session-proxy:
+    image: python:3.12-alpine
+    container_name: mcp-session-proxy
+    restart: unless-stopped
+    command:
+      - python3
+      - -u
+      - /srv/proxy.py
+    volumes:
+      - ./session-proxy/proxy.py:/srv/proxy.py:ro
+      - ./.env:/opt/docker/compose/mcp/.env:ro
+    environment:
+      MCP_PROXY_UPSTREAM: http://mcp-gateway:8811/mcp
+      MCP_PROXY_UPSTREAM_TIMEOUT: "900"
+      MCP_PROXY_HOST: "0.0.0.0"
+      MCP_PROXY_PORT: "8812"
+    ports:
+      - "8811:8812"
+      - "8812:8812"
+    depends_on:
+      - mcp-gateway
+    networks:
+      - mcp
+volumes:
+
+  searxng-cache:
+    name: searxng-cache
+
+  valkey-data:
+    name: searxng-valkey
+
+
+
+networks:
+
+  mcp:
+    name: ai-mcp
+    driver: bridge

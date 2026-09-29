@@ -1,0 +1,48 @@
+{
+  "timeout": 30,
+  "retries": 0,
+  "providers": {
+    "litellm": {
+      "base_url": "http://your-litellm-host:4000/v1",
+      "api_key": "sk-YOUR_LITELLM_API_KEY",
+      "format": "openai"
+    }
+  },
+  "members": [
+    {
+      "id": "openrouter/free",
+      "provider": "litellm",
+      "model": "openrouter/free"
+    },
+    {
+      "id": "groq/openai/gpt-oss-120b",
+      "provider": "litellm",
+      "model": "groq/openai/gpt-oss-120b"
+    },
+    {
+      "id": "groq/openai/gpt-oss-20b",
+      "provider": "litellm",
+      "model": "groq/openai/gpt-oss-20b"
+    },
+    {
+      "id": "groq/qwen/qwen3.8-27b",
+      "provider": "litellm",
+      "model": "groq/qwen/qwen3.8-27b"
+    },
+    {
+      "id": "ollama-cloud/gpt-oss:120b",
+      "provider": "litellm",
+      "model": "ollama-cloud/gpt-oss:120b"
+    },
+    {
+      "id": "ollama-cloud/nemotron-3-super",
+      "provider": "litellm",
+      "model": "ollama-cloud/nemotron-3-super"
+    },
+    {
+      "id": "deepseek4free/deepseek/auto",
+      "provider": "litellm",
+      "model": "deepseek4free/deepseek/auto"
+    }
+  ]
+}
