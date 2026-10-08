@@ -39,7 +39,7 @@ A self-hosted, Docker Compose-based stack that runs the [Docker MCP Gateway](htt
 | `chroma` | `chromadb/chroma:latest` | ChromaDB vector store, used by the Chroma MCP server for persistent semantic memory |
 | `torproxy` | `dperson/torproxy` | SOCKS5 (9050) + HTTP (8118) Tor proxy, used by OnionClaw |
 | `mcp-image-checker` | `docker:cli` | Cron-like sidecar (hourly) that pulls required images and rebuilds the two locally built MCP server images if missing |
-| `model-council-sync` | `python:3.12-alpine` | Keeps the council's `inference4free/*/auto` seats in step with LiteLLM: adds new providers, drops vanished ones (after a grace period), never touches hand-written members; restarts the gateway only when the roster actually changed |
+| `model-council-sync` | `python:3.12-alpine` | Keeps the council's rule-owned seats in step with LiteLLM (inference4free `auto` routers, small+free Groq/Ollama/Gemini models, `:free` OpenRouter models): adds new ones, drops vanished ones (after a grace period), never touches hand-written members; restarts the gateway only when the roster actually changed |
 
 ### MCP servers registered in the gateway
 
@@ -106,7 +106,7 @@ The config defines the LiteLLM provider and the council **members** (models that
 
 ### Model Council auto-sync (`model-council-sync`)
 
-The council server reads its roster **once at startup**, while the providers behind it change over time: new `inference4free` routers appear (and vanish), Groq / Ollama Cloud / Gemini expose a shifting mix of paid and free models. The `model-council-sync` sidecar reconciles the roster every `SYNC_INTERVAL` seconds (default 1h):
+The council server reads its roster **once at startup**, while the providers behind it change over time: new `inference4free` routers appear (and vanish), Groq / Ollama Cloud / Gemini expose a shifting mix of paid and free models, and OpenRouter rotates its `:free` catalogue. The `model-council-sync` sidecar reconciles the roster every `SYNC_INTERVAL` seconds (default 1h):
 
 1. lists the models LiteLLM currently exposes (`GET /v1/models`, credentials taken from the config's own `providers.litellm` block);
 2. decides which models belong on the council with a **rules engine** (`model-council-data/sync-rules.json`, auto-created with defaults on first run):
@@ -118,7 +118,7 @@ The council server reads its roster **once at startup**, while the providers beh
 4. **never touches** members no rule claims — by default that is only `openrouter/free` and `small-model`; a rule's `exclude` list protects specific ids the same way;
 5. rewrites `config.json` atomically (previous copy kept as `config.json.bak`, strikes tracked in `.sync-state.json`) **only when something actually changed**, then restarts `mcp-gateway` so the council picks the new roster up — client sessions are healed transparently by `mcp-session-proxy`.
 
-Rule knobs (per provider: `inference4free`, `groq`, `ollama-cloud`, `gemini`): `pattern`, `exclude`, `max_params_b`, `small_keywords`, `allow` (regex on the model's last segment — the Gemini default admits only the text flash/flash-lite family and small Gemma models, skipping image/audio/TTS/preview variants), `free` (`always` = free by construction, probe = aliveness only; `probe` = the probe decides free vs paid and re-checks owned seats every cycle). Global env knobs: `SYNC_INTERVAL`, `REMOVE_AFTER_MISSES`, `PROBE_ENABLED`, `PROBE_TIMEOUT`, `RESTART_GATEWAY`, `GATEWAY_CONTAINER`, `LITELLM_BASE_URL`/`LITELLM_API_KEY`.
+Rule knobs (per provider: `inference4free`, `groq`, `ollama-cloud`, `gemini`, `openrouter`): `pattern`, `exclude`, `max_params_b`, `small_keywords`, `allow` (regex *searched* against the model's last segment — the Gemini default admits only the text flash/flash-lite family and small Gemma models, skipping image/audio/TTS/preview variants; the OpenRouter rule admits only ids ending in `:free`, the cost signal OpenRouter puts in the model id — LiteLLM does not carry the price through `/model/info`), `free` (`always` = free by construction, probe = aliveness only; `probe` = the probe decides free vs paid), `probe_existing` (re-check owned seats every cycle; default on for `free:"probe"`, but the OpenRouter rule opts **out** — re-probing hourly would burn the daily free quota, so seats there are policed by disappearance only, while candidates are still probed once before joining). Global env knobs: `SYNC_INTERVAL`, `REMOVE_AFTER_MISSES`, `PROBE_ENABLED`, `PROBE_TIMEOUT`, `RESTART_GATEWAY`, `GATEWAY_CONTAINER`, `LITELLM_BASE_URL`/`LITELLM_API_KEY`.
 
 ### SearXNG
 
@@ -139,7 +139,7 @@ Rule knobs (per provider: `inference4free`, `groq`, `ollama-cloud`, `gemini`): `
 │   ├── config.json.bak      # Pre-sync backup (git-ignored)
 │   └── .sync-state.json     # Sync strike state (git-ignored)
 ├── model-council-sync/
-│   └── sync.py              # Auto-sync of inference4free 'auto' council seats
+│   └── sync.py              # Auto-sync of dynamic council seats (rules engine)
 ├── onionclaw/
 │   └── Dockerfile           # Builds onionclaw-mcp:latest
 ├── onionclaw-data/          # SICRY SQLite DB (git-ignored)

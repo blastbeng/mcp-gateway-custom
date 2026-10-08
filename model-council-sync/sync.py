@@ -28,7 +28,9 @@ Every cycle this script:
 
        a rule with free:"always" (inference4free) only probes candidates
        for aliveness; a rule with free:"probe" also re-probes its existing
-       seats every cycle, so a model that turns paid gets struck out;
+       seats every cycle (probe_existing, on by default — a rule may opt
+       out to spare the provider's daily free quota), so a model that
+       turns paid gets struck out;
   3. strikes seats that vanish from litellm or probe as paid/gone — removal
      happens after REMOVE_AFTER_MISSES consecutive strikes, so a transient
      provider hiccup does not churn the roster (and restart the gateway);
@@ -73,9 +75,13 @@ DOCKER_SOCK = os.environ.get("DOCKER_SOCK", "/var/run/docker.sock")
 # max_params_b: candidate size ceiling from the name ("20b", "675b"...);
 #           null disables the size filter
 # small_keywords: size fallback when the name carries no parameter count
-# allow    : regex on the model's last segment, narrowing candidates further
+# allow    : regex (searched) on the model's last segment, narrowing
+#            candidates further — e.g. ":free$" for openrouter
 # free     : "always" (free by construction, probe = aliveness only) or
-#            "probe" (probe decides free vs paid, existing seats re-probed)
+#            "probe" (probe decides free vs paid)
+# probe_existing: re-probe seated models every cycle (default true for
+#            free:"probe"); set false when a re-probe would burn the
+#            provider's daily free quota — candidates are still probed once
 DEFAULT_RULES = {
     "rules": [
         {"id": "inference4free", "pattern": r"^inference4free/(?:[^/]+/)?auto$",
@@ -87,6 +93,13 @@ DEFAULT_RULES = {
          "allow": r"^gemini(-[\d.]+)?-flash(-lite)?$"
                   r"|^gemini-flash(-lite)?-latest$"
                   r"|^gemma-\d+-\d+b"},
+        # openrouter: the ":free" suffix is the cost signal (the probe
+        # confirms it); openrouter/free stays hand-written. Re-probing seats
+        # every hour would eat the daily free quota — candidates only.
+        {"id": "openrouter", "pattern": r"^openrouter/",
+         "exclude": ["openrouter/free"],
+         "max_params_b": None, "free": "probe",
+         "probe_existing": False, "allow": r":free$"},
     ]
 }
 
@@ -441,7 +454,7 @@ def sync_cycle() -> None:
             continue
         if size_class(model, rule) != "small":
             continue
-        if rule["allow"] and not rule["allow"].match(model.rsplit("/", 1)[-1]):
+        if rule["allow"] and not rule["allow"].search(model.rsplit("/", 1)[-1]):
             continue
         if not PROBE_ENABLED:
             log(f"candidate {model} skipped: probing disabled")
