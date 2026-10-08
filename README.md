@@ -39,6 +39,7 @@ A self-hosted, Docker Compose-based stack that runs the [Docker MCP Gateway](htt
 | `chroma` | `chromadb/chroma:latest` | ChromaDB vector store, used by the Chroma MCP server for persistent semantic memory |
 | `torproxy` | `dperson/torproxy` | SOCKS5 (9050) + HTTP (8118) Tor proxy, used by OnionClaw |
 | `mcp-image-checker` | `docker:cli` | Cron-like sidecar (hourly) that pulls required images and rebuilds the two locally built MCP server images if missing |
+| `model-council-sync` | `python:3.12-alpine` | Keeps the council's `inference4free/*/auto` seats in step with LiteLLM: adds new providers, drops vanished ones (after a grace period), never touches hand-written members; restarts the gateway only when the roster actually changed |
 
 ### MCP servers registered in the gateway
 
@@ -103,6 +104,18 @@ The config defines the LiteLLM provider and the council **members** (models that
 }
 ```
 
+### Model Council auto-sync (`model-council-sync`)
+
+New `inference4free` providers appear on LiteLLM over time (and some disappear), while the council server reads its roster **once at startup**. The `model-council-sync` sidecar reconciles them every `SYNC_INTERVAL` seconds (default 1h):
+
+1. lists the models LiteLLM currently exposes (`GET /v1/models`, credentials taken from the config's own `providers.litellm` block);
+2. **adds** a seat `{ "id": "<model>", "provider": "litellm", "model": "<model>" }` for every auto router (`inference4free/<provider>/auto`, plus the bare `inference4free/auto`) that is missing — with `PROBE_ENABLED=true` only after a one-token "ping" proves the upstream answers;
+3. **removes** seats whose model LiteLLM no longer exposes — only after `REMOVE_AFTER_MISSES` consecutive cycles (default 2), so a transient LiteLLM gap doesn't churn the roster;
+4. **never touches** hand-written members (`openrouter/free`, `groq/*`, `ollama-cloud/*`, ...); when a sync-owned seat already exists, its custom fields (`label`, `weight`, `enabled`, ...) are preserved;
+5. rewrites `config.json` atomically (previous copy kept as `config.json.bak`, removal grace tracked in `.sync-state.json`) **only when something actually changed**, then restarts `mcp-gateway` so the council picks the new roster up — client sessions are healed transparently by `mcp-session-proxy`.
+
+All knobs are environment variables: `SYNC_INTERVAL`, `REMOVE_AFTER_MISSES`, `PROBE_ENABLED`, `PROBE_TIMEOUT`, `RESTART_GATEWAY`, `GATEWAY_CONTAINER`, `I4F_PATTERN`, `LITELLM_BASE_URL`/`LITELLM_API_KEY`.
+
 ### SearXNG
 
 `searxng/settings.yml` is bind-mounted read/write into the container (SearXNG regenerates/updates it at startup). Valkey is used for caching.
@@ -117,7 +130,11 @@ The config defines the LiteLLM provider and the council **members** (models that
 │   └── Dockerfile           # Builds model-council-mcp:latest
 ├── model-council-data/
 │   ├── config.example.json  # Council config template (safe to commit)
-│   └── config.json          # Real config with API key (git-ignored)
+│   ├── config.json          # Real config with API key (git-ignored)
+│   ├── config.json.bak      # Pre-sync backup (git-ignored)
+│   └── .sync-state.json     # Sync removal-grace state (git-ignored)
+├── model-council-sync/
+│   └── sync.py              # Auto-sync of inference4free 'auto' council seats
 ├── onionclaw/
 │   └── Dockerfile           # Builds onionclaw-mcp:latest
 ├── onionclaw-data/          # SICRY SQLite DB (git-ignored)
@@ -177,6 +194,7 @@ Or point any MCP client (Claude Desktop, AiderDesk, etc.) at `http://<host>:8812
 - **Never commit `.env`, `model-council-data/config.json`, or any runtime data.** They are git-ignored; only `config.example.json` is tracked.
 - The gateway binds to `127.0.0.1` only; the session proxy fronts it for external clients and forwards the bearer token.
 - Tor traffic from OnionClaw is routed exclusively through the `torproxy` container.
+- `model-council-sync` mounts the Docker socket (read-only) to restart the gateway after roster changes; if the host is exposed, consider fronting it with a [docker-socket-proxy](https://github.com/Tecnativa/docker-socket-proxy) restricted to `POST /containers/*/restart`.
 - SearXNG and ChromaDB ports should be firewall-restricted if the host is exposed.
 
 ## License

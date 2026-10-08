@@ -4,6 +4,9 @@
 .env
 # real council config (contains LiteLLM API key)
 model-council-data/config.json
+model-council-data/*.bak
+# model-council-sync runtime state (removal-grace counters)
+model-council-data/.sync-state.json
 
 # ============================================================
 # Runtime data (databases, caches, vector stores, volumes)

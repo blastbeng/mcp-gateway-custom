@@ -3,6 +3,7 @@ services:
   mcp-image-checker:
     image: docker:cli
     container_name: mcp-image-checker
+    mem_limit: 128m
     restart: no
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
@@ -69,6 +70,7 @@ services:
   torproxy:
     image: dperson/torproxy:latest
     container_name: torproxy
+    mem_limit: 256m
     restart: no
 
     environment:
@@ -99,6 +101,7 @@ services:
   mcp-gateway:
     image: docker/mcp-gateway:latest
     container_name: mcp-gateway
+    mem_limit: 512m
     restart: "no"
 
     command:
@@ -141,6 +144,7 @@ services:
   searxng:
     image: docker.io/searxng/searxng:latest
     container_name: searxng
+    mem_limit: 512m
     restart: "no"
 
     environment:
@@ -163,12 +167,13 @@ services:
   valkey:
     image: docker.io/valkey/valkey:9-alpine
     container_name: searxng-valkey
+    mem_limit: 256m
     restart: "no"
 
     command:
       - valkey-server
       - --save
-      - "30"
+      - "300"
       - "1"
       - --loglevel
       - warning
@@ -185,6 +190,7 @@ services:
   chroma:
     image: chromadb/chroma:latest
     container_name: chroma
+    mem_limit: 1g
     restart: no
 
     volumes:
@@ -196,6 +202,36 @@ services:
     networks:
       - mcp
 
+  # Keeps the council's inference4free 'auto' seats in step with LiteLLM:
+  # adds a seat when a new provider appears, drops one after its model has
+  # vanished for REMOVE_AFTER_MISSES cycles, never touches hand-written
+  # members. Rewrites config.json only on a real change, then restarts the
+  # gateway so the council server (which reads its roster once at startup)
+  # picks it up — healed for clients by mcp-session-proxy.
+  model-council-sync:
+    image: python:3.12-alpine
+    container_name: model-council-sync
+    mem_limit: 64m
+    restart: unless-stopped
+    command:
+      - python3
+      - -u
+      - /srv/sync.py
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./model-council-data:/config:rw
+      - ./model-council-sync:/srv:ro
+    environment:
+      SYNC_INTERVAL: "3600"
+      REMOVE_AFTER_MISSES: "2"
+      PROBE_ENABLED: "true"
+      RESTART_GATEWAY: "true"
+      GATEWAY_CONTAINER: "mcp-gateway"
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - mcp
+
   # Session-healing reverse proxy in front of the docker-mcp gateway.
   # The gateway evicts idle in-memory MCP sessions (and loses them on
   # restart); streamable-HTTP clients that cache Mcp-Session-Id then hit a
@@ -204,6 +240,7 @@ services:
   mcp-session-proxy:
     image: python:3.12-alpine
     container_name: mcp-session-proxy
+    mem_limit: 256m
     restart: unless-stopped
     command:
       - python3
