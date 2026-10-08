@@ -36,6 +36,11 @@ Every cycle this script:
      provider hiccup does not churn the roster (and restart the gateway);
      a rule whose seats ALL come back paid in one cycle is treated as a
      gateway-wide failure, not as N dead models (circuit breaker);
+     candidates get the same economy: a model rejected with a stable
+     verdict (paid/gone) accumulates candidate strikes and after
+     CANDIDATE_STRIKES of them stops being probed for
+     CANDIDATE_RETRY_HOURS — unknown verdicts never count, so genuinely
+     transient failures keep being retried every cycle;
   4. rewrites config.json atomically (previous copy kept as .bak) only when
      something actually changed, and then restarts the gateway so the
      council server — which reads its roster once at startup — picks the
@@ -65,6 +70,8 @@ RUN_ONCE = os.environ.get("RUN_ONCE", "").lower() in ("1", "true", "yes", "on")
 PROBE_ENABLED = os.environ.get("PROBE_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 PROBE_TIMEOUT = float(os.environ.get("PROBE_TIMEOUT", "25"))
 REMOVE_AFTER_MISSES = max(1, int(os.environ.get("REMOVE_AFTER_MISSES", "2")))
+CANDIDATE_STRIKES = max(1, int(os.environ.get("CANDIDATE_STRIKES", "2")))
+CANDIDATE_RETRY_HOURS = float(os.environ.get("CANDIDATE_RETRY_HOURS", "24"))
 RESTART_GATEWAY = os.environ.get("RESTART_GATEWAY", "true").lower() in ("1", "true", "yes", "on")
 GATEWAY_CONTAINER = os.environ.get("GATEWAY_CONTAINER", "mcp-gateway")
 DOCKER_SOCK = os.environ.get("DOCKER_SOCK", "/var/run/docker.sock")
@@ -141,18 +148,20 @@ def load_state() -> dict:
         with open(STATE_PATH, "r", encoding="utf-8") as f:
             state = json.load(f)
         if isinstance(state, dict) and isinstance(state.get("strikes"), dict):
+            state.setdefault("candidate_strikes", {})
             return state
         if isinstance(state, dict) and isinstance(state.get("grace"), dict):
             # pre-engine state: grace counters were all "model went missing"
             return {"strikes": {m: {"n": int(v.get("misses", 0)),
                                     "reason": "missing", "last": v.get("last_missing", "")}
-                                for m, v in state["grace"].items()}}
+                                for m, v in state["grace"].items()},
+                    "candidate_strikes": {}}
         log(f"state file {STATE_PATH} has an unexpected shape — starting fresh")
     except FileNotFoundError:
         pass
     except Exception as e:
         log(f"state file {STATE_PATH} unreadable ({type(e).__name__}: {e}) — starting fresh")
-    return {"strikes": {}}
+    return {"strikes": {}, "candidate_strikes": {}}
 
 
 def save_state(state: dict) -> None:
@@ -361,6 +370,25 @@ def strike(state: dict, model: str, reason: str) -> bool:
     return False
 
 
+def candidate_strike(state: dict, model: str, reason: str) -> None:
+    """Record one stable rejection of a candidate (paid/gone only — unknown
+    verdicts are transient and never count). After CANDIDATE_STRIKES in a
+    row the model goes on cooldown: no probes for CANDIDATE_RETRY_HOURS,
+    then it is retried once and re-cooled if still bad."""
+    cache = state["candidate_strikes"]
+    entry = cache.get(model)
+    if entry is None or entry.get("reason") != reason:
+        entry = {"n": 0, "reason": reason, "until": 0}
+        cache[model] = entry
+    entry["n"] += 1
+    if entry["n"] >= CANDIDATE_STRIKES:
+        entry["until"] = time.time() + CANDIDATE_RETRY_HOURS * 3600
+        log(f"  candidate {model}: {entry['n']}x {reason} — on cooldown "
+            f"for {CANDIDATE_RETRY_HOURS:g}h")
+    else:
+        log(f"  candidate {model} strike {entry['n']}/{CANDIDATE_STRIKES} ({reason})")
+
+
 # --------------------------------------------------------------------------- #
 # One sync cycle
 # --------------------------------------------------------------------------- #
@@ -459,18 +487,33 @@ def sync_cycle() -> None:
         if not PROBE_ENABLED:
             log(f"candidate {model} skipped: probing disabled")
             continue
+        # Candidate strikes: a model that keeps failing with a stable
+        # verdict stops burning probe quota for CANDIDATE_RETRY_HOURS.
+        entry = state["candidate_strikes"].get(model)
+        if entry and time.time() < entry.get("until", 0):
+            log(f"  candidate {model} on cooldown ({entry['reason']} x{entry['n']}) — skip")
+            continue
         verdict, detail = probe(base, key, model)
         if rule["free"] == "always":
             # Free by construction: the probe only gates on aliveness.
             if verdict != "ok":
                 log(f"  probe {model} not alive ({verdict}: {detail})")
+                if verdict in ("paid", "gone"):
+                    candidate_strike(state, model, verdict)
                 continue
         elif verdict not in ("ok", "free"):
             log(f"  probe {model} rejected ({verdict}: {detail})")
+            if verdict in ("paid", "gone"):
+                candidate_strike(state, model, verdict)
             continue
+        state["candidate_strikes"].pop(model, None)
         owned[model] = (rule, {"id": model, "provider": "litellm", "model": model})
         added.append(model)
 
+    # Candidate-strike entries for models litellm no longer lists are dead
+    # weight — the model cannot be probed anyway and would start fresh.
+    state["candidate_strikes"] = {m: e for m, e in state["candidate_strikes"].items()
+                                  if m in live}
     if added:
         log("added: " + ", ".join(added))
     save_state(state)
@@ -494,7 +537,8 @@ def sync_cycle() -> None:
 
 def main() -> None:
     log(f"model-council-sync started (interval={SYNC_INTERVAL}s, probe={PROBE_ENABLED}, "
-        f"remove_after={REMOVE_AFTER_MISSES} strikes, restart={RESTART_GATEWAY})")
+        f"remove_after={REMOVE_AFTER_MISSES} strikes, "
+        f"candidates={CANDIDATE_STRIKES}x/{CANDIDATE_RETRY_HOURS:g}h, restart={RESTART_GATEWAY})")
     while True:
         try:
             sync_cycle()

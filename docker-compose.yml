@@ -202,12 +202,14 @@ services:
     networks:
       - mcp
 
-  # Keeps the council's inference4free 'auto' seats in step with LiteLLM:
-  # adds a seat when a new provider appears, drops one after its model has
-  # vanished for REMOVE_AFTER_MISSES cycles, never touches hand-written
-  # members. Rewrites config.json only on a real change, then restarts the
-  # gateway so the council server (which reads its roster once at startup)
-  # picks it up — healed for clients by mcp-session-proxy.
+  # Keeps the council's rule-owned seats in step with LiteLLM (rules engine,
+  # see model-council-data/sync-rules.json): adds a seat when a qualifying
+  # model appears, drops one after it has failed REMOVE_AFTER_MISSES cycles,
+  # puts permanently-rejected candidates on a CANDIDATE_RETRY_HOURS cooldown,
+  # never touches hand-written members. Rewrites config.json only on a real
+  # change, then restarts the gateway so the council server (which reads its
+  # roster once at startup) picks it up — healed for clients by
+  # mcp-session-proxy.
   model-council-sync:
     image: python:3.12-alpine
     container_name: model-council-sync
@@ -224,6 +226,8 @@ services:
     environment:
       SYNC_INTERVAL: "3600"
       REMOVE_AFTER_MISSES: "2"
+      CANDIDATE_STRIKES: "2"
+      CANDIDATE_RETRY_HOURS: "24"
       PROBE_ENABLED: "true"
       RESTART_GATEWAY: "true"
       GATEWAY_CONTAINER: "mcp-gateway"
