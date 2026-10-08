@@ -106,15 +106,19 @@ The config defines the LiteLLM provider and the council **members** (models that
 
 ### Model Council auto-sync (`model-council-sync`)
 
-New `inference4free` providers appear on LiteLLM over time (and some disappear), while the council server reads its roster **once at startup**. The `model-council-sync` sidecar reconciles them every `SYNC_INTERVAL` seconds (default 1h):
+The council server reads its roster **once at startup**, while the providers behind it change over time: new `inference4free` routers appear (and vanish), Groq / Ollama Cloud / Gemini expose a shifting mix of paid and free models. The `model-council-sync` sidecar reconciles the roster every `SYNC_INTERVAL` seconds (default 1h):
 
 1. lists the models LiteLLM currently exposes (`GET /v1/models`, credentials taken from the config's own `providers.litellm` block);
-2. **adds** a seat `{ "id": "<model>", "provider": "litellm", "model": "<model>" }` for every auto router (`inference4free/<provider>/auto`, plus the bare `inference4free/auto`) that is missing — with `PROBE_ENABLED=true` only after a one-token "ping" proves the upstream answers;
-3. **removes** seats whose model LiteLLM no longer exposes — only after `REMOVE_AFTER_MISSES` consecutive cycles (default 2), so a transient LiteLLM gap doesn't churn the roster;
-4. **never touches** hand-written members (`openrouter/free`, `groq/*`, `ollama-cloud/*`, ...); when a sync-owned seat already exists, its custom fields (`label`, `weight`, `enabled`, ...) are preserved;
-5. rewrites `config.json` atomically (previous copy kept as `config.json.bak`, removal grace tracked in `.sync-state.json`) **only when something actually changed**, then restarts `mcp-gateway` so the council picks the new roster up — client sessions are healed transparently by `mcp-session-proxy`.
+2. decides which models belong on the council with a **rules engine** (`model-council-data/sync-rules.json`, auto-created with defaults on first run):
 
-All knobs are environment variables: `SYNC_INTERVAL`, `REMOVE_AFTER_MISSES`, `PROBE_ENABLED`, `PROBE_TIMEOUT`, `RESTART_GATEWAY`, `GATEWAY_CONTAINER`, `I4F_PATTERN`, `LITELLM_BASE_URL`/`LITELLM_API_KEY`.
+   - a **size engine** classifies each model from its name — an explicit parameter count (`8b`, `27b`, `675b`...) against the rule's `max_params_b` (default 32B), else whole-word small keywords (`flash`, `mini`, `nano`, `instant`, ...); unknown size is never added;
+   - a **free engine** probes each candidate with a one-token chat completion and classifies the answer — since no credits are ever topped up on these providers, `402/401/403` (and billing-worded `400`) means *paid*, `429` means *free but throttled*, `404` means *gone*, `200` means *usable*; `5xx`/timeouts are *unknown* and retried next cycle, and a rule whose seats **all** probe paid in one cycle is treated as a gateway-wide failure (circuit breaker), not N dead models;
+
+3. **adds** qualifying models as seats `{ "id", "provider": "litellm", "model" }`; **strikes** owned seats that vanish from LiteLLM, probe as paid/gone, or no longer meet the size rule — removal happens after `REMOVE_AFTER_MISSES` consecutive strikes (default 2), so a transient hiccup doesn't churn the roster;
+4. **never touches** members no rule claims — by default that is only `openrouter/free` and `small-model`; a rule's `exclude` list protects specific ids the same way;
+5. rewrites `config.json` atomically (previous copy kept as `config.json.bak`, strikes tracked in `.sync-state.json`) **only when something actually changed**, then restarts `mcp-gateway` so the council picks the new roster up — client sessions are healed transparently by `mcp-session-proxy`.
+
+Rule knobs (per provider: `inference4free`, `groq`, `ollama-cloud`, `gemini`): `pattern`, `exclude`, `max_params_b`, `small_keywords`, `allow` (regex on the model's last segment — the Gemini default admits only the text flash/flash-lite family and small Gemma models, skipping image/audio/TTS/preview variants), `free` (`always` = free by construction, probe = aliveness only; `probe` = the probe decides free vs paid and re-checks owned seats every cycle). Global env knobs: `SYNC_INTERVAL`, `REMOVE_AFTER_MISSES`, `PROBE_ENABLED`, `PROBE_TIMEOUT`, `RESTART_GATEWAY`, `GATEWAY_CONTAINER`, `LITELLM_BASE_URL`/`LITELLM_API_KEY`.
 
 ### SearXNG
 
@@ -130,9 +134,10 @@ All knobs are environment variables: `SYNC_INTERVAL`, `REMOVE_AFTER_MISSES`, `PR
 │   └── Dockerfile           # Builds model-council-mcp:latest
 ├── model-council-data/
 │   ├── config.example.json  # Council config template (safe to commit)
+│   ├── sync-rules.json      # Auto-sync engine rules (safe to commit)
 │   ├── config.json          # Real config with API key (git-ignored)
 │   ├── config.json.bak      # Pre-sync backup (git-ignored)
-│   └── .sync-state.json     # Sync removal-grace state (git-ignored)
+│   └── .sync-state.json     # Sync strike state (git-ignored)
 ├── model-council-sync/
 │   └── sync.py              # Auto-sync of inference4free 'auto' council seats
 ├── onionclaw/

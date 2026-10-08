@@ -1,36 +1,47 @@
 #!/usr/bin/env python3
-"""Keep the inference4free 'auto' seats of the model council in step with litellm.
+"""Keep the sync-owned seats of the model council in step with litellm.
 
 The council config (model-council-data/config.json) holds two kinds of members:
 
-  * hand-written members (openrouter/free, groq/*, ollama-cloud/*, ...) —
-    these are owned by the human and are never touched;
-  * the inference4free auto-router seats (inference4free/<provider>/auto and
-    the bare inference4free/auto) — these are owned by this sync.
-
-New inference4free providers appear on litellm over time, and some disappear;
-the council server reads its roster once at startup, so the file has to be
-kept current for the council to ever see a new seat.
+  * hand-written members — owned by the human, never touched by this sync
+    (anything no rule claims, plus every id a rule explicitly excludes);
+  * rule-owned seats — managed here, added and removed dynamically.
 
 Every cycle this script:
 
   1. lists the models litellm currently exposes (GET /v1/models);
-  2. adds a seat for every auto router that is missing — optionally only
-     after a tiny "ping" chat completion proves the seat actually answers,
-     because many of these free upstreams are reverse-engineered and dead;
-  3. drops seats whose model litellm no longer exposes, but only after the
-     model has been missing for REMOVE_AFTER_MISSES consecutive cycles, so a
-     litellm hiccup does not churn the roster (and restart the gateway) for
-     nothing;
+  2. for every rule (see model-council-data/sync-rules.json, auto-created
+     with defaults on first run), offers each live model the rule claims:
+
+       - the size engine classifies the model from its name — an explicit
+         parameter count (8b, 27b, 675b...) against the rule's max_params_b,
+         else the rule's small_keywords (flash, mini, nano, instant...);
+         unknown size means a model is never added;
+       - the free engine decides whether the model is actually usable
+         without credits (we never top these providers up), by probing it:
+
+           200          -> ok        (free, answers)
+           429          -> free      (rate-limited: still the free tier)
+           402/401/403  -> paid      (needs credits/entitlement)
+           404          -> gone      (provider stopped serving it)
+           anything else-> unknown   (transient: skipped, no penalty)
+
+       a rule with free:"always" (inference4free) only probes candidates
+       for aliveness; a rule with free:"probe" also re-probes its existing
+       seats every cycle, so a model that turns paid gets struck out;
+  3. strikes seats that vanish from litellm or probe as paid/gone — removal
+     happens after REMOVE_AFTER_MISSES consecutive strikes, so a transient
+     provider hiccup does not churn the roster (and restart the gateway);
+     a rule whose seats ALL come back paid in one cycle is treated as a
+     gateway-wide failure, not as N dead models (circuit breaker);
   4. rewrites config.json atomically (previous copy kept as .bak) only when
-     something actually changed, and then restarts the gateway so the council
-     server picks the new roster up. The session proxy heals client sessions
-     across that restart, so callers never see it.
+     something actually changed, and then restarts the gateway so the
+     council server — which reads its roster once at startup — picks the
+     new roster up. The session proxy heals client sessions across that
+     restart, so callers never see it.
 
 Credentials come from the config's own providers.litellm block — no new
 secrets — and can be overridden with LITELLM_BASE_URL / LITELLM_API_KEY.
-
-Everything is a plain environment knob; defaults suit the compose service.
 """
 from __future__ import annotations
 
@@ -46,11 +57,9 @@ import urllib.request
 
 CONFIG_PATH = os.environ.get("CONFIG_PATH", "/config/config.json")
 STATE_PATH = os.environ.get("STATE_PATH", "/config/.sync-state.json")
+RULES_PATH = os.environ.get("RULES_PATH", "/config/sync-rules.json")
 SYNC_INTERVAL = int(os.environ.get("SYNC_INTERVAL", "3600"))
 RUN_ONCE = os.environ.get("RUN_ONCE", "").lower() in ("1", "true", "yes", "on")
-# Bare global router + one router per provider: inference4free/auto,
-# inference4free/deepseek/auto, ... (specific models are NOT sync-owned).
-I4F_PATTERN = re.compile(os.environ.get("I4F_PATTERN", r"^inference4free/(?:[^/]+/)?auto$"))
 PROBE_ENABLED = os.environ.get("PROBE_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 PROBE_TIMEOUT = float(os.environ.get("PROBE_TIMEOUT", "25"))
 REMOVE_AFTER_MISSES = max(1, int(os.environ.get("REMOVE_AFTER_MISSES", "2")))
@@ -58,7 +67,36 @@ RESTART_GATEWAY = os.environ.get("RESTART_GATEWAY", "true").lower() in ("1", "tr
 GATEWAY_CONTAINER = os.environ.get("GATEWAY_CONTAINER", "mcp-gateway")
 DOCKER_SOCK = os.environ.get("DOCKER_SOCK", "/var/run/docker.sock")
 
-_STATE_DEFAULT = {"grace": {}}
+# Default engine rules — written to RULES_PATH on first run, editable there.
+# pattern  : which model ids the rule owns (first matching rule wins)
+# exclude  : ids that stay hand-written even if the pattern matches
+# max_params_b: candidate size ceiling from the name ("20b", "675b"...);
+#           null disables the size filter
+# small_keywords: size fallback when the name carries no parameter count
+# allow    : regex on the model's last segment, narrowing candidates further
+# free     : "always" (free by construction, probe = aliveness only) or
+#            "probe" (probe decides free vs paid, existing seats re-probed)
+DEFAULT_RULES = {
+    "rules": [
+        {"id": "inference4free", "pattern": r"^inference4free/(?:[^/]+/)?auto$",
+         "max_params_b": None, "free": "always"},
+        {"id": "groq", "pattern": r"^groq/", "max_params_b": 32, "free": "probe"},
+        {"id": "ollama-cloud", "pattern": r"^ollama-cloud/", "max_params_b": 32, "free": "probe"},
+        {"id": "gemini", "pattern": r"^gemini/",
+         "max_params_b": 32, "free": "probe",
+         "allow": r"^gemini(-[\d.]+)?-flash(-lite)?$"
+                  r"|^gemini-flash(-lite)?-latest$"
+                  r"|^gemma-\d+-\d+b"},
+    ]
+}
+
+_SMALL_KEYWORDS = ("flash", "lite", "mini", "nano", "instant", "small", "haiku")
+# "120b" / "675b" / "31b" — an explicit parameter count in the model name.
+_PARAM_RE = re.compile(r"(?:^|[^a-z\d])(\d{1,3}(?:\.\d+)?)b(?![a-z0-9])", re.I)
+# Error text that means "this seat costs money we do not have".
+_PAID_HINTS = ("insufficient", "credit", "billing", "payment", "purchase",
+               "subscription", "top up", "top-up", "upgrade", "requires a paid",
+               "not entitled", "no active")
 
 
 def log(msg: str) -> None:
@@ -66,7 +104,7 @@ def log(msg: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Config / state I/O
+# Config / state / rules I/O
 # --------------------------------------------------------------------------- #
 def load_config() -> dict:
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -89,14 +127,19 @@ def load_state() -> dict:
     try:
         with open(STATE_PATH, "r", encoding="utf-8") as f:
             state = json.load(f)
-        if isinstance(state, dict) and isinstance(state.get("grace"), dict):
+        if isinstance(state, dict) and isinstance(state.get("strikes"), dict):
             return state
+        if isinstance(state, dict) and isinstance(state.get("grace"), dict):
+            # pre-engine state: grace counters were all "model went missing"
+            return {"strikes": {m: {"n": int(v.get("misses", 0)),
+                                    "reason": "missing", "last": v.get("last_missing", "")}
+                                for m, v in state["grace"].items()}}
         log(f"state file {STATE_PATH} has an unexpected shape — starting fresh")
     except FileNotFoundError:
         pass
     except Exception as e:
         log(f"state file {STATE_PATH} unreadable ({type(e).__name__}: {e}) — starting fresh")
-    return json.loads(json.dumps(_STATE_DEFAULT))
+    return {"strikes": {}}
 
 
 def save_state(state: dict) -> None:
@@ -105,6 +148,48 @@ def save_state(state: dict) -> None:
         json.dump(state, f, indent=2)
         f.write("\n")
     os.replace(tmp, STATE_PATH)
+
+
+def load_rules() -> list[dict]:
+    """Rules from RULES_PATH; written there with defaults on first run. A file
+    that exists but cannot be used aborts the cycle — rules drive removals,
+    so silently falling back to defaults could strike the wrong seats."""
+    if not os.path.exists(RULES_PATH):
+        with open(RULES_PATH, "w", encoding="utf-8") as f:
+            json.dump(DEFAULT_RULES, f, indent=2)
+            f.write("\n")
+        log(f"no rules file — wrote defaults to {RULES_PATH}")
+        raw = json.loads(json.dumps(DEFAULT_RULES))
+    else:
+        try:
+            with open(RULES_PATH, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+        except Exception as e:
+            raise ValueError(f"rules file {RULES_PATH} unreadable "
+                             f"({type(e).__name__}: {e}) — cycle aborted") from e
+    rules = raw.get("rules") if isinstance(raw, dict) else None
+    if not isinstance(rules, list) or not rules:
+        raise ValueError(f"rules file {RULES_PATH} has no rules list — cycle aborted")
+    parsed = []
+    for r in rules:
+        try:
+            pattern = re.compile(r["pattern"])
+            free = r.get("free", "probe")
+            if free not in ("always", "probe"):
+                raise ValueError(f"free must be 'always' or 'probe', got {free!r}")
+            parsed.append({
+                "id": str(r.get("id", pattern.pattern)),
+                "pattern": pattern,
+                "exclude": set(r.get("exclude") or []),
+                "max_params_b": None if r.get("max_params_b") is None else float(r["max_params_b"]),
+                "small_keywords": tuple(r.get("small_keywords") or _SMALL_KEYWORDS),
+                "allow": re.compile(r["allow"]) if r.get("allow") else None,
+                "free": free,
+                "probe_existing": bool(r.get("probe_existing", free == "probe")),
+            })
+        except Exception as e:
+            raise ValueError(f"bad rule {r.get('id', '?')}: {e} — cycle aborted") from e
+    return parsed
 
 
 # --------------------------------------------------------------------------- #
@@ -133,7 +218,10 @@ def list_models(base: str, key: str) -> set[str]:
     return {m["id"] for m in data.get("data", []) if isinstance(m, dict) and m.get("id")}
 
 
-def _probe_once(base: str, key: str, model: str, body: dict) -> tuple[bool, str]:
+# --------------------------------------------------------------------------- #
+# The free engine — one probe, classified
+# --------------------------------------------------------------------------- #
+def _post_chat(base: str, key: str, model: str, body: dict) -> tuple[int, str]:
     req = urllib.request.Request(
         base + "/chat/completions",
         data=json.dumps(body).encode("utf-8"),
@@ -142,30 +230,74 @@ def _probe_once(base: str, key: str, model: str, body: dict) -> tuple[bool, str]
     )
     try:
         with urllib.request.urlopen(req, timeout=PROBE_TIMEOUT) as resp:
-            return resp.status == 200, ""
+            return resp.status, ""
     except urllib.error.HTTPError as e:
         detail = ""
         try:
-            detail = e.read().decode(errors="replace")[:160]
+            detail = e.read().decode(errors="replace")[:200]
         except Exception:
             pass
-        return False, f"HTTP {e.code} {detail}".rstrip()
+        return e.code, detail
     except Exception as e:
-        return False, f"{type(e).__name__}: {e}"
+        return 0, f"{type(e).__name__}: {e}"
 
 
-def probe_alive(base: str, key: str, model: str) -> bool:
+def classify(status: int, detail: str) -> str:
+    """One probe answer -> ok | free | paid | gone | unknown."""
+    if status == 200:
+        return "ok"
+    if status == 429:
+        return "free"                     # throttled, not paid: the free tier
+    if status == 404:
+        return "gone"
+    if status in (401, 402, 403):
+        return "paid"
+    if status == 400 and any(h in detail.lower() for h in _PAID_HINTS):
+        return "paid"
+    return "unknown"
+
+
+def probe(base: str, key: str, model: str) -> tuple[str, str]:
     """One-token chat completion; a second try without max_tokens covers
     upstreams that choke on the parameter but would otherwise answer."""
     detail = ""
     for body in ({"model": model, "messages": [{"role": "user", "content": "ping"}],
                   "max_tokens": 1},
                  {"model": model, "messages": [{"role": "user", "content": "ping"}]}):
-        ok, detail = _probe_once(base, key, model, body)
-        if ok:
-            return True
-    log(f"  probe {model} failed: {detail}")
-    return False
+        status, detail = _post_chat(base, key, model, body)
+        if status == 200:
+            return "ok", ""
+        verdict = classify(status, detail)
+        if verdict != "unknown":
+            return verdict, detail
+    return "unknown", detail
+
+
+# --------------------------------------------------------------------------- #
+# The size engine — what the name says about the model
+# --------------------------------------------------------------------------- #
+def size_class(model_id: str, rule: dict) -> str:
+    """small | big | unknown. Unknown is never added; existing seats are not
+    size-filtered (they were a human choice)."""
+    if rule["max_params_b"] is None:
+        return "small"                    # size filter disabled for this rule
+    name = model_id.rsplit("/", 1)[-1].lower()
+    m = _PARAM_RE.search(name)
+    if m:
+        return "small" if float(m.group(1)) <= rule["max_params_b"] else "big"
+    # Whole words only: "mini" must catch qwen-mini, not minimax (230B).
+    if any(re.search(rf"\b{re.escape(k)}\b", name) for k in rule["small_keywords"]):
+        return "small"
+    return "unknown"
+
+
+def owner_rule(model_id: str, rules: list[dict]) -> dict | None:
+    """The first rule claiming this id, or None if it stays hand-written
+    (no rule matches, or the matching rule excludes it)."""
+    for rule in rules:
+        if rule["pattern"].match(model_id):
+            return None if model_id in rule["exclude"] else rule
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -201,12 +333,29 @@ def restart_gateway() -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# Strikes — consecutive cycles of evidence that a seat does not belong
+# --------------------------------------------------------------------------- #
+def strike(state: dict, model: str, reason: str) -> bool:
+    """Record one strike; True when the seat has struck out (remove it)."""
+    entry = state["strikes"].setdefault(model, {"n": 0, "reason": reason, "last": ""})
+    entry["n"] += 1
+    entry["reason"] = reason
+    entry["last"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    if entry["n"] >= REMOVE_AFTER_MISSES:
+        state["strikes"].pop(model, None)
+        return True
+    log(f"{model} strike {entry['n']}/{REMOVE_AFTER_MISSES} ({reason})")
+    return False
+
+
+# --------------------------------------------------------------------------- #
 # One sync cycle
 # --------------------------------------------------------------------------- #
 def sync_cycle() -> None:
     cfg = load_config()
     base, key = litellm_endpoint(cfg)
     live = list_models(base, key)
+    rules = load_rules()
 
     members = cfg.get("members")
     if not isinstance(members, list):
@@ -214,66 +363,116 @@ def sync_cycle() -> None:
         return
 
     state = load_state()
-    grace: dict = state["grace"]
-
-    # Split the roster: sync-owned auto seats vs hand-written members.
-    keepers: list = []
-    owned: dict[str, dict] = {}
+    # Split the roster: hand-written members (untouched) vs rule-owned seats.
+    hand: list = []
+    owned: dict[str, tuple[dict, dict]] = {}
+    orig_owned: set[str] = set()
     for entry in members:
-        if isinstance(entry, dict) and I4F_PATTERN.match(str(entry.get("model", ""))):
-            owned[str(entry["model"])] = entry
+        rule = owner_rule(str(entry.get("model", "")), rules) if isinstance(entry, dict) else None
+        if rule is None:
+            hand.append(entry)
         else:
-            keepers.append(entry)
+            owned[str(entry["model"])] = (rule, entry)
+            orig_owned.add(str(entry["model"]))
 
-    # ADD: every live auto router the config does not have yet. Models outside
-    # the pattern (the hundreds of other models litellm exposes, embedding
-    # models included) are none of this sync's business.
-    added: list[str] = []
-    seats: dict[str, dict] = {}
-    for model in sorted(live):
-        if not I4F_PATTERN.match(model):
-            continue
-        if model in owned:
-            seats[model] = owned[model]
-            continue
-        if PROBE_ENABLED and not probe_alive(base, key, model):
-            continue  # retried next cycle
-        seats[model] = {"id": model, "provider": "litellm", "model": model}
-        added.append(model)
+    struck_now: set[str] = set()
 
-    # REMOVE: owned seats whose model vanished — after REMOVE_AFTER_MISSES
-    # consecutive cycles without it, so transient litellm gaps don't churn.
-    removed: list[str] = []
+    # Vanished models: every owned seat litellm no longer lists.
     for model in sorted(owned):
-        if model in live:
-            grace.pop(model, None)
+        if model not in live:
+            if strike(state, model, "missing"):
+                log(f"struck out: {model} (gone from litellm)")
+                del owned[model]
+            struck_now.add(model)
+
+    # Size applies to owned seats too: the engine owns these models, and a
+    # seat that no longer meets its rule's idea of "small" is on its way out.
+    # Grace-damped like every other strike, so an engine bug cannot wipe the
+    # roster in one cycle.
+    for model in sorted(owned):
+        if model in struck_now:           # one strike reason per cycle
             continue
-        counter = grace.setdefault(model, {"misses": 0})
-        counter["misses"] += 1
-        counter["last_missing"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-        if counter["misses"] >= REMOVE_AFTER_MISSES:
-            removed.append(model)
-            seats.pop(model, None)
-            grace.pop(model, None)
-        else:
-            log(f"{model} missing from litellm ({counter['misses']}/{REMOVE_AFTER_MISSES}) — in grace")
-            seats[model] = owned[model]
+        rule = owned[model][0]
+        if rule["max_params_b"] is None or size_class(model, rule) == "small":
+            continue
+        if strike(state, model, "oversize"):
+            log(f"struck out: {model} (no longer small per rule {rule['id']})")
+            del owned[model]
+        struck_now.add(model)
+
+    # Re-probe existing seats of probe rules — this is how a model that
+    # turned paid (or died) gets struck out while it still lists.
+    if PROBE_ENABLED:
+        for rule in rules:
+            if not rule["probe_existing"]:
+                continue
+            targets = [m for m, (r, _) in owned.items() if r["id"] == rule["id"]]
+            verdicts = {m: probe(base, key, m)[0] for m in targets}
+            paid = [m for m, v in verdicts.items() if v == "paid"]
+            if len(paid) >= 2 and len(paid) == len(verdicts):
+                log(f"rule {rule['id']}: every seat probed paid — treating as a "
+                    f"gateway-wide failure, not {len(paid)} dead models")
+                verdicts = {m: "unknown" for m in verdicts}
+            for m, v in verdicts.items():
+                if v in ("ok", "free"):
+                    # A healthy probe clears a missing/paid strike — the seat
+                    # recovered — but never an oversize one: no probe makes a
+                    # big model small.
+                    entry = state["strikes"].get(m)
+                    if entry is None or entry.get("reason") != "oversize":
+                        state["strikes"].pop(m, None)
+                elif v in ("paid", "gone"):
+                    if strike(state, m, v):
+                        log(f"struck out: {m} ({v} on probe)")
+                        del owned[m]
+                    struck_now.add(m)
+            ok_n = sum(1 for v in verdicts.values() if v in ("ok", "free"))
+            if targets:
+                log(f"rule {rule['id']}: {ok_n}/{len(targets)} owned seats healthy")
+
+    # Candidates: live models a rule claims, not seated yet. Size first
+    # (free), then the allow filter, then the probe (costly, bounded).
+    added: list[str] = []
+    for model in sorted(live):
+        if model in owned:
+            continue
+        rule = owner_rule(model, rules)
+        if rule is None:
+            continue
+        if size_class(model, rule) != "small":
+            continue
+        if rule["allow"] and not rule["allow"].match(model.rsplit("/", 1)[-1]):
+            continue
+        if not PROBE_ENABLED:
+            log(f"candidate {model} skipped: probing disabled")
+            continue
+        verdict, detail = probe(base, key, model)
+        if rule["free"] == "always":
+            # Free by construction: the probe only gates on aliveness.
+            if verdict != "ok":
+                log(f"  probe {model} not alive ({verdict}: {detail})")
+                continue
+        elif verdict not in ("ok", "free"):
+            log(f"  probe {model} rejected ({verdict}: {detail})")
+            continue
+        owned[model] = (rule, {"id": model, "provider": "litellm", "model": model})
+        added.append(model)
 
     if added:
         log("added: " + ", ".join(added))
-    if removed:
-        log("removed: " + ", ".join(removed))
     save_state(state)
 
+    removed = sorted(orig_owned - set(owned))
     if not added and not removed:
-        log(f"roster in sync ({len(keepers)} hand-written + {len(seats)} "
-            f"inference4free auto seats) — no changes")
+        log(f"roster in sync ({len(hand)} hand-written + {len(owned)} rule-owned "
+            f"seats) — no changes")
         return
-
-    cfg["members"] = keepers + [seats[m] for m in sorted(seats)]
+    if removed:
+        log("removed: " + ", ".join(removed))
+    cfg["members"] = hand + [owned[m][1] for m in sorted(owned)]
     write_config(cfg)
-    log(f"config rewritten: {len(keepers)} hand-written + {len(seats)} "
-        f"inference4free auto seats (backup: {CONFIG_PATH}.bak)")
+    log(f"config rewritten: {len(hand)} hand-written + {len(owned)} rule-owned "
+        f"seats (backup: {CONFIG_PATH}.bak)")
     if RESTART_GATEWAY:
         restart_gateway()
     else:
@@ -282,7 +481,7 @@ def sync_cycle() -> None:
 
 def main() -> None:
     log(f"model-council-sync started (interval={SYNC_INTERVAL}s, probe={PROBE_ENABLED}, "
-        f"remove_after={REMOVE_AFTER_MISSES} misses, restart={RESTART_GATEWAY})")
+        f"remove_after={REMOVE_AFTER_MISSES} strikes, restart={RESTART_GATEWAY})")
     while True:
         try:
             sync_cycle()
