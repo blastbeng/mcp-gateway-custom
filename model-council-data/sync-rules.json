@@ -1,1 +1,36 @@
-{"rules":[{"id":"inference4free","pattern":"^inference4free/(?:[^/]+/)?auto$","max_params_b":null,"free":"always"},{"id":"groq","pattern":"^groq/","max_params_b":32,"free":"probe"},{"id":"ollama-cloud","pattern":"^ollama-cloud/","max_params_b":32,"free":"probe"},{"id":"gemini","pattern":"^gemini/","max_params_b":32,"free":"probe","allow":"^gemini(-[\\d.]+)?-flash(-lite)?$|^gemini-flash(-lite)?-latest$|^gemma-\\d+-\\d+b"},{"id":"openrouter","pattern":"^openrouter/","exclude":["openrouter/free"],"max_params_b":null,"free":"probe","allow":":free$"}]}
+{
+  "rules": [
+    {
+      "id": "inference4free",
+      "pattern": "^inference4free/",
+      "max_params_b": null,
+      "free": "always"
+    },
+    {
+      "id": "groq",
+      "pattern": "^groq/",
+      "max_params_b": 32,
+      "free": "probe"
+    },
+    {
+      "id": "ollama-cloud",
+      "pattern": "^ollama-cloud/",
+      "max_params_b": 32,
+      "free": "probe"
+    },
+    {
+      "id": "gemini",
+      "pattern": "^gemini/",
+      "max_params_b": 32,
+      "free": "probe",
+      "allow": "^gemini(-[\\d.]+)?-flash(-lite)?$|^gemini-flash(-lite)?-latest$|^gemma-\\d+-\\d+b"
+    },
+    {
+      "id": "openrouter",
+      "pattern": "^openrouter/",
+      "max_params_b": null,
+      "free": "probe",
+      "allow": "(?::free$|^free$)"
+    }
+  ]
+}
