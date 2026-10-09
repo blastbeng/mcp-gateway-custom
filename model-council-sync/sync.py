@@ -35,14 +35,19 @@ Every cycle this script:
            anything else-> unknown   (transient: skipped, no penalty)
 
        a rule with free:"always" (inference4free) probes candidates for
-       aliveness only; a rule with free:"probe" also re-probes its existing
-       seats every cycle (probe_existing, on by default — a rule may opt
-       out to spare the provider's daily free quota), so a model that
-       turns paid gets struck out. Admission itself is the same for every
-       rule: only an "ok" probe ever adds a candidate;
-  3. strikes seats that vanish from litellm or probe as paid/gone — removal
-     happens after REMOVE_AFTER_MISSES consecutive strikes, so a transient
-     provider hiccup does not churn the roster (and restart the gateway);
+       aliveness only; a rule with free:"probe" probes for free vs paid.
+       Every rule also re-probes its existing seats every cycle
+       (probe_existing, on by default — a rule may opt out to spare the
+       provider's daily free quota): a seat that answers paid leaves the
+       roster the same cycle — the roster must never hold a paid model —
+       and comes back as a candidate the cycle it answers ok again.
+       Admission itself is the same for every rule: only an "ok" probe
+       ever adds a candidate;
+  3. strikes seats that vanish from litellm or probe as paid/gone. A paid
+     probe removes the seat the same cycle (a paid model must never sit
+     in the roster); gone/missing take REMOVE_AFTER_MISSES consecutive
+     strikes first, so a transient provider hiccup does not churn the
+     roster (and restart the gateway);
      a rule whose seats ALL come back paid in one cycle is treated as a
      gateway-wide failure, not as N dead models (circuit breaker);
      candidates get the same economy: a model rejected with a stable
@@ -99,8 +104,10 @@ DOCKER_SOCK = os.environ.get("DOCKER_SOCK", "/var/run/docker.sock")
 #            "probe" (probe decides free vs paid); either way a candidate
 #            is seated only on a probe that really answers ("ok")
 # probe_existing: re-probe seated models every cycle (default true for
-#            free:"probe"); set false when a re-probe would burn the
-#            provider's daily free quota — candidates are still probed once
+#            every rule — a seat that turns paid must leave the roster,
+#            not linger); set false only when a re-probe would burn the
+#            provider's daily free quota and a lingering paid seat is
+#            acceptable — candidates are probed once regardless
 DEFAULT_RULES = {
     "rules": [
         {"id": "inference4free", "pattern": r"^inference4free/(?:[^/]+/)?auto$",
@@ -113,12 +120,14 @@ DEFAULT_RULES = {
                   r"|^gemini-flash(-lite)?-latest$"
                   r"|^gemma-\d+-\d+b"},
         # openrouter: the ":free" suffix is the cost signal (the probe
-        # confirms it); openrouter/free stays hand-written. Re-probing seats
-        # every hour would eat the daily free quota — candidates only.
+        # confirms it); openrouter/free stays hand-written. Seats are
+        # re-probed like every rule's: a :free seat that starts charging
+        # must leave the roster. The hourly 1-token probe costs a sliver
+        # of the daily free quota — the price of never seating a paid model.
         {"id": "openrouter", "pattern": r"^openrouter/",
          "exclude": ["openrouter/free"],
          "max_params_b": None, "free": "probe",
-         "probe_existing": False, "allow": r":free$"},
+         "allow": r":free$"},
     ]
 }
 
@@ -219,7 +228,7 @@ def load_rules() -> list[dict]:
                 "small_keywords": tuple(r.get("small_keywords") or _SMALL_KEYWORDS),
                 "allow": re.compile(r["allow"]) if r.get("allow") else None,
                 "free": free,
-                "probe_existing": bool(r.get("probe_existing", free == "probe")),
+                "probe_existing": bool(r.get("probe_existing", True)),
             })
         except Exception as e:
             raise ValueError(f"bad rule {r.get('id', '?')}: {e} — cycle aborted") from e
@@ -475,8 +484,10 @@ def sync_cycle() -> None:
             del owned[model]
         struck_now.add(model)
 
-    # Re-probe existing seats of probe rules — this is how a model that
-    # turned paid (or died) gets struck out while it still lists.
+    # Re-probe existing seats of every rule (opt-out per rule) — this is
+    # how a model that turned paid (or died) gets struck out while it
+    # still lists. Paid leaves the same cycle: the roster must never
+    # hold a model that charges.
     if PROBE_ENABLED:
         for rule in rules:
             if not rule["probe_existing"]:
@@ -496,9 +507,18 @@ def sync_cycle() -> None:
                     entry = state["strikes"].get(m)
                     if entry is None or entry.get("reason") != "oversize":
                         state["strikes"].pop(m, None)
-                elif v in ("paid", "gone"):
+                elif v == "paid":
+                    # A paid verdict is stable evidence (401/402/403 + billing
+                    # text): the seat leaves the roster the same cycle — the
+                    # roster must never hold a paid model. It re-enters as a
+                    # candidate the cycle it stops charging.
+                    log(f"struck out: {m} (paid on probe — removed immediately)")
+                    state["strikes"].pop(m, None)
+                    del owned[m]
+                    struck_now.add(m)
+                elif v == "gone":
                     if strike(state, m, v):
-                        log(f"struck out: {m} ({v} on probe)")
+                        log(f"struck out: {m} (gone on probe)")
                         del owned[m]
                     struck_now.add(m)
             ok_n = sum(1 for v in verdicts.values() if v in ("ok", "free"))
