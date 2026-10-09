@@ -18,19 +18,28 @@ Every cycle this script:
          else the rule's small_keywords (flash, mini, nano, instant...);
          unknown size means a model is never added;
        - the free engine decides whether the model is actually usable
-         without credits (we never top these providers up), by probing it:
+         without credits (we never top these providers up), by probing it.
+         Only a probe that really answers adds a model: "ok" demands a
+         well-formed completion body, not just HTTP 200 — an errored or
+         throttled candidate is left out this cycle and simply retried
+         (nothing is written off: a model that starts answering later is
+         picked up on a later cycle):
 
-           200          -> ok        (free, answers)
-           429          -> free      (rate-limited: still the free tier)
+           200 + valid completion body -> ok    (works — the only verdict that adds)
+           200 but malformed/error body-> unknown (transient: skipped, no penalty)
+           429          -> free      (rate-limited: still the free tier;
+                                      healthy for a seated model, but an
+                                      errored probe — not enough to add)
            402/401/403  -> paid      (needs credits/entitlement)
            404          -> gone      (provider stopped serving it)
            anything else-> unknown   (transient: skipped, no penalty)
 
-       a rule with free:"always" (inference4free) only probes candidates
-       for aliveness; a rule with free:"probe" also re-probes its existing
+       a rule with free:"always" (inference4free) probes candidates for
+       aliveness only; a rule with free:"probe" also re-probes its existing
        seats every cycle (probe_existing, on by default — a rule may opt
        out to spare the provider's daily free quota), so a model that
-       turns paid gets struck out;
+       turns paid gets struck out. Admission itself is the same for every
+       rule: only an "ok" probe ever adds a candidate;
   3. strikes seats that vanish from litellm or probe as paid/gone — removal
      happens after REMOVE_AFTER_MISSES consecutive strikes, so a transient
      provider hiccup does not churn the roster (and restart the gateway);
@@ -39,8 +48,10 @@ Every cycle this script:
      candidates get the same economy: a model rejected with a stable
      verdict (paid/gone) accumulates candidate strikes and after
      CANDIDATE_STRIKES of them stops being probed for
-     CANDIDATE_RETRY_HOURS — unknown verdicts never count, so genuinely
-     transient failures keep being retried every cycle;
+     CANDIDATE_RETRY_HOURS — then it is retried once and re-cooled if
+     still bad; unknown verdicts never count, so genuinely transient
+     failures keep being retried every cycle. Nothing is permanent:
+     every rejection is undone the cycle the model answers again;
   4. rewrites config.json atomically (previous copy kept as .bak) only when
      something actually changed, and then restarts the gateway so the
      council server — which reads its roster once at startup — picks the
@@ -85,7 +96,8 @@ DOCKER_SOCK = os.environ.get("DOCKER_SOCK", "/var/run/docker.sock")
 # allow    : regex (searched) on the model's last segment, narrowing
 #            candidates further — e.g. ":free$" for openrouter
 # free     : "always" (free by construction, probe = aliveness only) or
-#            "probe" (probe decides free vs paid)
+#            "probe" (probe decides free vs paid); either way a candidate
+#            is seated only on a probe that really answers ("ok")
 # probe_existing: re-probe seated models every cycle (default true for
 #            free:"probe"); set false when a re-probe would burn the
 #            provider's daily free quota — candidates are still probed once
@@ -252,7 +264,7 @@ def _post_chat(base: str, key: str, model: str, body: dict) -> tuple[int, str]:
     )
     try:
         with urllib.request.urlopen(req, timeout=PROBE_TIMEOUT) as resp:
-            return resp.status, ""
+            return resp.status, resp.read().decode(errors="replace")
     except urllib.error.HTTPError as e:
         detail = ""
         try:
@@ -265,7 +277,9 @@ def _post_chat(base: str, key: str, model: str, body: dict) -> tuple[int, str]:
 
 
 def classify(status: int, detail: str) -> str:
-    """One probe answer -> ok | free | paid | gone | unknown."""
+    """One probe answer -> ok | free | paid | gone | unknown. A 200 maps
+    to "ok" here; probe() additionally validates the body before
+    believing it — a malformed one downgrades to unknown."""
     if status == 200:
         return "ok"
     if status == 429:
@@ -279,20 +293,40 @@ def classify(status: int, detail: str) -> str:
     return "unknown"
 
 
+def _valid_completion(body: str) -> bool:
+    """HTTP 200 alone is not proof of life: the body must be a well-formed
+    chat completion — no error object smuggled in (an explicit null counts
+    as none), at least one choice. Content may legitimately be empty
+    (reasoning models spend their first token on reasoning), so only the
+    shape is checked."""
+    try:
+        data = json.loads(body)
+    except Exception:
+        return False
+    if not isinstance(data, dict) or data.get("error") is not None:
+        return False
+    return isinstance(data.get("choices"), list) and len(data["choices"]) > 0
+
+
 def probe(base: str, key: str, model: str) -> tuple[str, str]:
     """One-token chat completion; a second try without max_tokens covers
-    upstreams that choke on the parameter but would otherwise answer."""
+    upstreams that choke on the parameter but would otherwise answer.
+    "ok" means a well-formed completion body actually came back — an
+    HTTP 200 carrying garbage is downgraded to unknown and retried next
+    cycle, so a model is added only once it demonstrably answers."""
     detail = ""
     for body in ({"model": model, "messages": [{"role": "user", "content": "ping"}],
                   "max_tokens": 1},
                  {"model": model, "messages": [{"role": "user", "content": "ping"}]}):
         status, detail = _post_chat(base, key, model, body)
         if status == 200:
-            return "ok", ""
+            if _valid_completion(detail):
+                return "ok", ""
+            continue                      # 200 but garbage — try the other body
         verdict = classify(status, detail)
         if verdict != "unknown":
             return verdict, detail
-    return "unknown", detail
+    return "unknown", detail[:200]
 
 
 # --------------------------------------------------------------------------- #
@@ -494,14 +528,11 @@ def sync_cycle() -> None:
             log(f"  candidate {model} on cooldown ({entry['reason']} x{entry['n']}) — skip")
             continue
         verdict, detail = probe(base, key, model)
-        if rule["free"] == "always":
-            # Free by construction: the probe only gates on aliveness.
-            if verdict != "ok":
-                log(f"  probe {model} not alive ({verdict}: {detail})")
-                if verdict in ("paid", "gone"):
-                    candidate_strike(state, model, verdict)
-                continue
-        elif verdict not in ("ok", "free"):
+        # Admission is strict and uniform: the model must actually answer
+        # with a valid completion. A 429 ("free") is an errored probe —
+        # never admitted and never struck; the next cycle retries it, so
+        # a throttled model joins the roster as soon as it answers.
+        if verdict != "ok":
             log(f"  probe {model} rejected ({verdict}: {detail})")
             if verdict in ("paid", "gone"):
                 candidate_strike(state, model, verdict)
