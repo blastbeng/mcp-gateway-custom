@@ -35,7 +35,7 @@ A self-hosted, Docker Compose-based stack that runs the [Docker MCP Gateway](htt
 | `mcp-gateway` | `docker/mcp-gateway:latest` | Central MCP gateway (streamable-HTTP on port 8811, exposed as `127.0.0.1:8813`) |
 | `mcp-session-proxy` | `python:3.12-alpine` | Reverse proxy that heals MCP sessions: owns one upstream session, hands clients a **stable session id**, and transparently re-initializes on upstream 404 (`session not found`) |
 | `searxng` | `searxng/searxng:latest` | Privacy-respecting metasearch engine, used by the SearXNG MCP server |
-| `valkey` | `valkey/valkey:9-alpine` | Cache backend for SearXNG |
+| `valkey` | `valkey/valkey:9-alpine` | Limiter/botdetection backend for SearXNG (disabled); search results are cached in SQLite on the `searxng-cache` volume |
 | `chroma` | `chromadb/chroma:latest` | ChromaDB vector store, used by the Chroma MCP server for persistent semantic memory |
 | `torproxy` | `dperson/torproxy` | SOCKS5 (9050) + HTTP (8118) Tor proxy, used by OnionClaw |
 | `mcp-image-checker` | `docker:cli` | Cron-like sidecar (hourly) that pulls required images and rebuilds the two locally built MCP server images if missing |
@@ -48,6 +48,7 @@ Defined in [`catalog/custom.yaml`](catalog/custom.yaml) as a custom catalog (`lo
 | Server | Type | Description |
 |---|---|---|
 | `searxng` | Local | Web search through the local SearXNG instance |
+| `open-websearch` | Local | Self-hosted multi-engine keyword search (Bing, DuckDuckGo, Brave, Startpage, Exa, Hacker News), no API keys — robust fallback to SearXNG |
 | `chroma` | Local | Persistent semantic vector memory (project knowledge, architectural decisions, code patterns) |
 | `onionclaw` | Local | **OnionClaw / SICRY** — Tor and dark-web OSINT: multi-engine onion search, .onion fetch/crawl, engine health checks, structured OSINT export |
 | `context7` | Remote | Up-to-date, version-specific library/framework documentation ([mcp.context7.com](https://mcp.context7.com)) |
@@ -119,7 +120,11 @@ Rule knobs (per provider: `inference4free`, `groq`, `ollama-cloud`, `gemini`, `o
 
 ### SearXNG
 
-`searxng/settings.yml` is bind-mounted read/write into the container (SearXNG regenerates/updates it at startup). Valkey is used for caching.
+`searxng/settings.yml` is bind-mounted read/write into the container (SearXNG regenerates/updates it at startup). Search results are cached in SQLite on the `searxng-cache` volume; the `valkey` container backs only the limiter/botdetection (currently disabled), **not** the search cache. The `outgoing` block raises the per-engine timeout so throttled upstreams still get a chance to answer.
+
+### Open WebSearch
+
+`open-websearch` runs as a gateway-managed local server (`ghcr.io/aas-ee/open-web-search:latest`, `MODE=stdio`) and provides a second, independent keyword-search path when the scraped SearXNG engines throttle. Its `search` tool takes an `engines` argument (`duckduckgo`, `brave`, `startpage`, `hackernews`, `exa`); no API keys are required.
 
 ## Repository layout
 

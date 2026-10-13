@@ -37,6 +37,25 @@ registry:
       - name: SEARXNG_URL
         value: http://searxng:8080
 
+  open-websearch:
+    title: Open WebSearch
+    type: server
+    image: ghcr.io/aas-ee/open-web-search:latest
+    description: >
+      Self-hosted multi-engine keyword search (Bing, DuckDuckGo, Brave,
+      Startpage, Exa, Hacker News) with no API keys. Robust fallback to the
+      local SearXNG instance.
+
+    env:
+      - name: MODE
+        value: "stdio"
+
+      - name: DEFAULT_SEARCH_ENGINE
+        value: "duckduckgo"
+
+      - name: ALLOWED_SEARCH_ENGINES
+        value: "duckduckgo,brave,startpage,hackernews,exa"
+
   onionclaw:
     title: OnionClaw / SICRY
     type: server

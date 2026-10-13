@@ -18,5 +18,12 @@ search:
     - html
     - json
 
+outgoing:
+  # Per-engine timeout: give throttled/slow upstreams a little more room
+  # before SearXNG gives up on them.
+  request_timeout: 5.0
+  pool_connections: 100
+  enable_http2: true
+
 limiter:
   enabled: false

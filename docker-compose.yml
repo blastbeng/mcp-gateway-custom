@@ -20,6 +20,7 @@ services:
 
           for image in \
             isokoliuk/mcp-searxng:latest \
+            ghcr.io/aas-ee/open-web-search:latest \
             mcp/fetch:latest \
             mcp/chroma:latest \
             ghcr.io/oraios/serena:latest
@@ -109,6 +110,7 @@ services:
       - --port=8811
       - --catalog=/root/.docker/mcp/catalogs/custom.yaml
       - --servers=searxng
+      - --servers=open-websearch
       - --servers=fetch
       - --servers=chroma
       - --servers=onionclaw      
