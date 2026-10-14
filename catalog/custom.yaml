@@ -70,6 +70,27 @@ registry:
       - name: TAVILY_API_KEY
         env: TAVILY_API_KEY
 
+  telegram-notify:
+    title: Telegram Notify
+    type: server
+    image: telegram-notify-mcp:latest
+    description: >
+      One-way Telegram notifications. One fixed bot, one fixed chat id:
+      both come from .env (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID), and every
+      send defaults to that chat. Use it to push
+      task-finished / needs-attention alerts and Open WebUI automation
+      output. Tools: send_message, send_document, send_photo, send_video,
+      send_audio, get_updates.
+
+    secrets:
+      - name: TELEGRAM_BOT_TOKEN
+        env: TELEGRAM_BOT_TOKEN
+
+      - name: TELEGRAM_CHAT_ID
+        env: TELEGRAM_CHAT_ID
+
+    longLived: true
+
   onionclaw:
     title: OnionClaw / SICRY
     type: server
@@ -133,6 +154,35 @@ registry:
 
     volumes:
       - "/opt/docker/compose/mcp/model-council-data:/config:ro"
+      - "/opt/projects:/opt/projects:ro"
+      - "/opt/docker/compose:/opt/docker/compose:ro"
+
+    longLived: true
+
+  playwright:
+    title: Playwright
+    type: server
+    image: mcp/playwright:latest
+    description: >
+      Headless browser automation (Chromium) from Microsoft's Playwright MCP:
+      navigate, snapshot, click, type, screenshot, evaluate and inspect network
+      traffic. Runs as a gateway-managed container instead of a host npx
+      process, so it no longer depends on the host Node runtime.
+
+    longLived: true
+
+  local-image-reader:
+    title: Local Image Reader
+    type: server
+    image: local-image-reader-mcp:latest
+    description: >
+      Reads a local image file and returns it as base64 ImageContent for a
+      vision-capable client model. Single tool: read_image
+      (PNG/JPEG/GIF/WebP/BMP/SVG). The project trees are bind-mounted
+      read-only at their original paths so a path the agent already knows
+      resolves unchanged inside the container.
+
+    volumes:
       - "/opt/projects:/opt/projects:ro"
       - "/opt/docker/compose:/opt/docker/compose:ro"
 

@@ -9,6 +9,8 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./onionclaw:/opt/onionclaw:ro
       - ./model-council:/opt/model-council:ro
+      - ./telegram-notify:/opt/telegram-notify:ro
+      - ./local-image-reader:/opt/local-image-reader:ro
     environment:
       CHECK_INTERVAL: "3600"
     command:
@@ -24,6 +26,8 @@ services:
             mcp/tavily:latest \
             mcp/fetch:latest \
             mcp/chroma:latest \
+            mcp/playwright:latest \
+            node:22-alpine \
             ghcr.io/oraios/serena:latest
           do
             if docker image inspect "$$image" >/dev/null 2>&1; then
@@ -63,6 +67,36 @@ services:
               -t model-council-mcp:latest \
               /opt/model-council \
               || echo "ERROR building model-council-mcp:latest"
+          fi
+
+          echo "--- Telegram Notify MCP ---"
+
+          if docker image inspect telegram-notify-mcp:latest >/dev/null 2>&1; then
+            echo "OK: telegram-notify-mcp:latest"
+          else
+            echo "MISSING: telegram-notify-mcp:latest"
+            echo "Building telegram-notify-mcp:latest..."
+
+            docker build \
+              --pull \
+              -t telegram-notify-mcp:latest \
+              /opt/telegram-notify \
+              || echo "ERROR building telegram-notify-mcp:latest"
+          fi
+
+          echo "--- Local Image Reader MCP ---"
+
+          if docker image inspect local-image-reader-mcp:latest >/dev/null 2>&1; then
+            echo "OK: local-image-reader-mcp:latest"
+          else
+            echo "MISSING: local-image-reader-mcp:latest"
+            echo "Building local-image-reader-mcp:latest..."
+
+            docker build \
+              --pull \
+              -t local-image-reader-mcp:latest \
+              /opt/local-image-reader \
+              || echo "ERROR building local-image-reader-mcp:latest"
           fi
 
           echo "Next check in $${CHECK_INTERVAL}s"
@@ -113,11 +147,14 @@ services:
       - --servers=searxng
       - --servers=open-websearch
       - --servers=tavily
+      - --servers=telegram-notify
       - --servers=fetch
       - --servers=chroma
       - --servers=onionclaw      
       - --servers=context7
       - --servers=model-council
+      - --servers=playwright
+      - --servers=local-image-reader
       - --verify-signatures=false
       - --secrets=/root/.docker/mcp/.env
 

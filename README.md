@@ -1,6 +1,6 @@
 # MCP Gateway Custom
 
-A self-hosted, Docker Compose-based stack that runs the [Docker MCP Gateway](https://github.com/docker/mcp-gateway) together with a curated set of MCP (Model Context Protocol) servers: local web search, documentation lookup, semantic vector memory, Tor/dark-web OSINT, and a multi-model "AI council".
+A self-hosted, Docker Compose-based stack that runs the [Docker MCP Gateway](https://github.com/docker/mcp-gateway) together with a curated set of MCP (Model Context Protocol) servers: local web search, documentation lookup, semantic vector memory, Tor/dark-web OSINT, headless browser automation, local image reading, and a multi-model "AI council".
 
 ## Architecture
 
@@ -38,7 +38,7 @@ A self-hosted, Docker Compose-based stack that runs the [Docker MCP Gateway](htt
 | `valkey` | `valkey/valkey:9-alpine` | Limiter/botdetection backend for SearXNG (disabled); search results are cached in SQLite on the `searxng-cache` volume |
 | `chroma` | `chromadb/chroma:latest` | ChromaDB vector store, used by the Chroma MCP server for persistent semantic memory |
 | `torproxy` | `dperson/torproxy` | SOCKS5 (9050) + HTTP (8118) Tor proxy, used by OnionClaw |
-| `mcp-image-checker` | `docker:cli` | Cron-like sidecar (hourly) that pulls required images and rebuilds the two locally built MCP server images if missing |
+| `mcp-image-checker` | `docker:cli` | Cron-like sidecar (hourly) that pulls required images and rebuilds the four locally built MCP server images if missing |
 | `model-council-sync` | `python:3.12-alpine` | Keeps the council roster in step with LiteLLM (all `inference4free` models, free-only OpenRouter models incl. the `openrouter/free` alias, small+free Groq/Ollama/Gemini): every seat is probe-verified before joining and re-probed while seated; drops vanished, paid, or repeatedly-failing seats; no static members — anything no rule claims is dropped; restarts the gateway only when the roster actually changed |
 
 ### MCP servers registered in the gateway
@@ -50,10 +50,13 @@ Defined in [`catalog/custom.yaml`](catalog/custom.yaml) as a custom catalog (`lo
 | `searxng` | Local | Web search through the local SearXNG instance |
 | `open-websearch` | Local | Self-hosted multi-engine keyword search (Bing, DuckDuckGo, Brave, Startpage, Exa, Hacker News), no API keys — robust fallback to SearXNG |
 | `tavily` | Local | Keyed search fallback (`TAVILY_API_KEY`, free tier, no card): search, extract, crawl, map, research — immune to scraper bot-detection and per-IP CAPTCHA cooldowns |
+| `telegram-notify` | Local | One-way Telegram notifications: one fixed bot, one fixed chat id (`TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID`) — task-finished, needs-attention and Open WebUI automation alerts |
 | `chroma` | Local | Persistent semantic vector memory (project knowledge, architectural decisions, code patterns) |
 | `onionclaw` | Local | **OnionClaw / SICRY** — Tor and dark-web OSINT: multi-engine onion search, .onion fetch/crawl, engine health checks, structured OSINT export |
 | `context7` | Remote | Up-to-date, version-specific library/framework documentation ([mcp.context7.com](https://mcp.context7.com)) |
 | `model-council` | Local | Multi-model "AI council" backed by LiteLLM: second opinions, code review, architecture advice, multi-model synthesis |
+| `playwright` | Local | Headless Chromium browser automation (Microsoft Playwright MCP): navigate, snapshot, click, type, screenshot, evaluate, inspect network — runs as a gateway container instead of a host `npx` process |
+| `local-image-reader` | Local | Reads a local image file and returns it as base64 `ImageContent` for a vision-capable client model (single tool: `read_image`) |
 
 ### Locally built MCP images
 
@@ -61,8 +64,10 @@ Defined in [`catalog/custom.yaml`](catalog/custom.yaml) as a custom catalog (`lo
 |---|---|---|
 | [`onionclaw/`](onionclaw/) | `onionclaw-mcp:latest` | Built from the [OnionClaw](https://github.com/JacobJandon/OnionClaw) repository |
 | [`model-council/`](model-council/) | `model-council-mcp:latest` | Thin wrapper: installs the `model-council-mcp` PyPI package |
+| [`telegram-notify/`](telegram-notify/) | `telegram-notify-mcp:latest` | Thin wrapper on `node:22-alpine`: installs the `telegram-notifier-mcp` npm package (pinned) |
+| [`local-image-reader/`](local-image-reader/) | `local-image-reader-mcp:latest` | Thin wrapper on `python:3.12-slim`: installs the `mcp-local-image-reader` PyPI package (pinned, `mcp<2`) |
 
-Both are built automatically by the `mcp-image-checker` sidecar when missing (or run manually: `docker build -t onionclaw-mcp:latest ./onionclaw`).
+All four are built automatically by the `mcp-image-checker` sidecar when missing (or run manually: `docker build -t local-image-reader-mcp:latest ./local-image-reader`). `node:22-alpine` is on the sidecar's pull list and, like these images, is in `PROTECTED_IMAGES` of `/usr/local/bin/manage-docker` so the monthly cleanup never deletes the base image the build needs. `mcp/playwright:latest` is likewise pulled by the sidecar and in `PROTECTED_IMAGES`.
 
 ## Configuration
 
@@ -75,6 +80,12 @@ All secrets live in a `.env` file at the repo root — **it is git-ignored and m
 MCP_GATEWAY_AUTH_TOKEN=change-me
 # Tavily Search API key (server `tavily`); free tier, no credit card
 TAVILY_API_KEY=
+# Telegram notifications (server `telegram-notify`): bot token + the ONE chat
+# that may be notified. On this host both are copied from
+# /opt/docker/compose/discord-llm-bot/.env.telegram (`TELOXIDE_TOKEN`,
+# `TEL_ALLOWED_CHATS`) — same bot, same chat, no second bot needed.
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
 ```
 
 This same file is mounted read-only into the gateway as `--secrets`, so any key added here is injected into the matching MCP server container at spawn time. A secret that is missing degrades to `<UNKNOWN>` rather than crashing the gateway, which is why the `tavily` server can be registered before a key exists.
@@ -152,6 +163,57 @@ TAVILY_API_KEY=tvly-...
 
 The free tier is 1,000 credits/month with **no credit card** ([app.tavily.com](https://app.tavily.com)); a basic search costs 1 credit, an advanced search 2. The server exposes `tavily_search`, `tavily_extract`, `tavily_crawl`, `tavily_map` and `tavily_research`. Until a key is set the server still registers and the gateway logs a benign `Secret 'TAVILY_API_KEY' not found` warning when the server is first spawned.
 
+### Telegram Notify
+
+`telegram-notify` pushes one-way notifications to a single Telegram chat — "task finished", "needs attention", or the result of an Open WebUI automation. It is the off-the-shelf [`telegram-notifier-mcp`](https://github.com/AdeshAtole/telegram-notifier-mcp) npm package (pinned `1.3.1`, MCP SDK + native `fetch`, no Telegram SDK), run from a thin local image so the gateway needs no network at spawn time:
+
+```bash
+docker build -t telegram-notify-mcp:latest ./telegram-notify
+```
+
+Both values come from `.env` (see [Secrets](#secrets-env)); the gateway injects them into the server container:
+
+```dotenv
+TELEGRAM_BOT_TOKEN=<token from @BotFather>
+TELEGRAM_CHAT_ID=<your numeric chat id>
+```
+
+**One destination only.** The server defaults every send to `TELEGRAM_CHAT_ID`, so no notification needs a chat id; the tools are `send_message`, `send_document`, `send_photo`, `send_video`, `send_audio` and `get_updates`. Two limits belong in the threat model:
+
+- the tools accept an optional `chatId` override — the container is deliberately *not* patched, so the only thing keeping the agent on one chat is that nothing ever asks it to pass one (and the fact that a bot can only reach chats that started it). Treat the model as untrusted: if a prompt-injected agent should be *unable* to message elsewhere, that needs server-side enforcement (a wrapper that drops `chatId`), not this image;
+- `get_updates` long-polls. The bot used here is the same one as `discord-llm-bot`, whose Teloxide client is already polling, so calling `get_updates` can hit a `409 Conflict` and steal pending updates from that bot. Sending is unaffected (plain `sendMessage`); just don't reach for `get_updates` while the other bot runs.
+
+Verify from the host (session proxy, bearer token from `.env`) — the gateway exposes these tools unprefixed (`send_message`, not `telegram-notify_send_message`):
+
+```bash
+curl -s -X POST http://localhost:8811/mcp \
+  -H "Authorization: Bearer $MCP_GATEWAY_AUTH_TOKEN" \
+  -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"send_message","arguments":{"text":"test"}}}'
+```
+
+### Playwright
+
+`playwright` is Microsoft's [Playwright MCP](https://github.com/microsoft/playwright-mcp) (`mcp/playwright:latest`) run as a gateway-managed container instead of the host `npx @playwright/mcp` process AiderDesk used to spawn. It drives headless Chromium — `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_take_screenshot`, `browser_evaluate`, `browser_network_requests` and the rest (23 tools).
+
+Running it in the gateway drops the host Node/npx dependency and keeps Chromium inside the container: the gateway starts it with `--init` (which reaps the Chromium process tree) and caps it at `--cpus 1 --memory 2Gb`. The image is ~1.7 GB, so it is on the `mcp-image-checker` pull list and in `PROTECTED_IMAGES` of `/usr/local/bin/manage-docker`.
+
+### Local Image Reader
+
+`local-image-reader` is a single-tool local server — `read_image` — that returns a local image file as base64 `ImageContent` for a vision-capable client model (PNG/JPEG/GIF/WebP/BMP/SVG). It is the containerised form of the `mcp-local-image-reader` host MCP AiderDesk used to launch with `uvx`; see [`local-image-reader/`](local-image-reader/).
+
+The project trees (`/opt/projects`, `/opt/docker/compose`) are bind-mounted **read-only at their original paths**, so a path the agent already knows resolves unchanged inside the container:
+
+```yaml
+volumes:
+  - "/opt/projects:/opt/projects:ro"
+  - "/opt/docker/compose:/opt/docker/compose:ro"
+```
+
+To expose another root, add it both in `catalog/custom.yaml` and in `MCP_GATEWAY_DOCKER_BIND_ALLOWED_PATHS` in `docker-compose.yml` — the gateway only permits host binds under a path listed there (read-write binds additionally require `MCP_GATEWAY_DOCKER_BIND_ALLOW_WRITABLE_PATHS`).
+
+The Dockerfile pins `mcp<2`: the upstream package declares only `mcp>=1.0.0`, so pip would otherwise resolve the 2.x MCP SDK, which dropped the low-level `Server.list_tools()` the server still calls.
+
 ## Repository layout
 
 ```
@@ -178,6 +240,10 @@ The free tier is 1,000 credits/month with **no credit card** ([app.tavily.com](h
 ├── session-proxy/
 │   ├── proxy.py             # Session-healing MCP reverse proxy
 │   └── README.md            # Proxy design details
+├── telegram-notify/
+│   └── Dockerfile           # Builds telegram-notify-mcp:latest
+├── local-image-reader/
+│   └── Dockerfile           # Builds local-image-reader-mcp:latest
 ├── docker-compose.yml       # Full stack definition
 └── .env                     # Secrets (git-ignored)
 ```
@@ -199,7 +265,7 @@ echo "MCP_GATEWAY_AUTH_TOKEN=$(openssl rand -hex 32)" >> .env
 cp model-council-data/config.example.json model-council-data/config.json
 # edit model-council-data/config.json with your LiteLLM URL + key
 
-docker compose build          # builds onionclaw-mcp and model-council-mcp
+docker compose build          # builds onionclaw-mcp, model-council-mcp, telegram-notify-mcp and local-image-reader-mcp
 docker compose up -d
 ```
 
@@ -227,6 +293,7 @@ Or point any MCP client (Claude Desktop, AiderDesk, etc.) at `http://<host>:8812
 - **Never commit `.env`, `model-council-data/config.json`, or any runtime data.** They are git-ignored; only `config.example.json` is tracked.
 - The gateway binds to `127.0.0.1` only; the session proxy fronts it for external clients and forwards the bearer token.
 - Tor traffic from OnionClaw is routed exclusively through the `torproxy` container.
+- Telegram notifications are one-way and confined to one chat by configuration (`TELEGRAM_CHAT_ID`); the bot token is shared with `discord-llm-bot` but is only ever used to *send*. The tools are not patched to reject a `chatId` override — see [Telegram Notify](#telegram-notify) if that guarantee ever needs to be hard.
 - `model-council-sync` mounts the Docker socket (read-only) to restart the gateway after roster changes; if the host is exposed, consider fronting it with a [docker-socket-proxy](https://github.com/Tecnativa/docker-socket-proxy) restricted to `POST /containers/*/restart`.
 - SearXNG and ChromaDB ports should be firewall-restricted if the host is exposed.
 
