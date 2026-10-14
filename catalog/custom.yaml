@@ -167,7 +167,20 @@ registry:
       Headless browser automation (Chromium) from Microsoft's Playwright MCP:
       navigate, snapshot, click, type, screenshot, evaluate and inspect network
       traffic. Runs as a gateway-managed container instead of a host npx
-      process, so it no longer depends on the host Node runtime.
+      process, so it no longer depends on the host Node runtime. Chromium
+      itself is baked into the image; the persistent browser profile is
+      bind-mounted from /opt so it stays off the (small) root filesystem and
+      survives gateway restarts.
+
+    # Chromium ships inside the image (PLAYWRIGHT_BROWSERS_PATH=/ms-playwright),
+    # but the persistent profile does not: the server writes it to
+    # $HOME/.cache/ms-playwright-mcp (HOME=/home/node, uid 1000), which would
+    # otherwise land in the container's writable layer, i.e. inside
+    # /var/lib/docker on the small root filesystem. Mounted from /opt instead -
+    # the same directory the old host npx server used, so logins/cookies carry
+    # over. Host dir is owned by uid 1000, which is the container's `node` user.
+    volumes:
+      - "/opt/blast/cache/ms-playwright-mcp:/home/node/.cache/ms-playwright-mcp:rw"
 
     longLived: true
 
@@ -178,12 +191,13 @@ registry:
     description: >
       Reads a local image file and returns it as base64 ImageContent for a
       vision-capable client model. Single tool: read_image
-      (PNG/JPEG/GIF/WebP/BMP/SVG). The project trees are bind-mounted
+      (PNG/JPEG/GIF/WebP/BMP/SVG). The project trees and /tmp are bind-mounted
       read-only at their original paths so a path the agent already knows
       resolves unchanged inside the container.
 
     volumes:
       - "/opt/projects:/opt/projects:ro"
       - "/opt/docker/compose:/opt/docker/compose:ro"
+      - "/tmp:/tmp:ro"
 
     longLived: true

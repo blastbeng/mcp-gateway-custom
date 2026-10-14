@@ -198,17 +198,29 @@ curl -s -X POST http://localhost:8811/mcp \
 
 Running it in the gateway drops the host Node/npx dependency and keeps Chromium inside the container: the gateway starts it with `--init` (which reaps the Chromium process tree) and caps it at `--cpus 1 --memory 2Gb`. The image is ~1.7 GB, so it is on the `mcp-image-checker` pull list and in `PROTECTED_IMAGES` of `/usr/local/bin/manage-docker`.
 
+**The browser profile lives on the host, not in the container.** Chromium itself is baked into the image (`PLAYWRIGHT_BROWSERS_PATH=/ms-playwright`), but the persistent profile is not — the server writes it to `$HOME/.cache/ms-playwright-mcp` (`HOME=/home/node`, uid 1000), which would otherwise end up in the container's writable layer, i.e. inside `/var/lib/docker` on the host's **root** filesystem. On this host `/` is the small filesystem (117 GB, ~23 GB free, 56 GB already in `/var/lib/docker`) while `/opt` is the big one (453 GB), so the profile is bind-mounted read-write from `/opt`:
+
+```yaml
+volumes:
+  - "/opt/blast/cache/ms-playwright-mcp:/home/node/.cache/ms-playwright-mcp:rw"
+```
+
+The host directory is owned by uid 1000, which is the container's `node` user, so no chown is needed; write access requires the path in `MCP_GATEWAY_DOCKER_BIND_ALLOW_WRITABLE_PATHS`. Note that the profile **directory name follows the browser build** baked into the image (`mcp-chrome-for-testing-<hash>`), so profiles written by a different Playwright version sit in sibling directories rather than being reused.
+
 ### Local Image Reader
 
 `local-image-reader` is a single-tool local server — `read_image` — that returns a local image file as base64 `ImageContent` for a vision-capable client model (PNG/JPEG/GIF/WebP/BMP/SVG). It is the containerised form of the `mcp-local-image-reader` host MCP AiderDesk used to launch with `uvx`; see [`local-image-reader/`](local-image-reader/).
 
-The project trees (`/opt/projects`, `/opt/docker/compose`) are bind-mounted **read-only at their original paths**, so a path the agent already knows resolves unchanged inside the container:
+The project trees (`/opt/projects`, `/opt/docker/compose`) and `/tmp` are bind-mounted **read-only at their original paths**, so a path the agent already knows resolves unchanged inside the container:
 
 ```yaml
 volumes:
   - "/opt/projects:/opt/projects:ro"
   - "/opt/docker/compose:/opt/docker/compose:ro"
+  - "/tmp:/tmp:ro"
 ```
+
+`/tmp` is shared so a screenshot or download written to a scratch path can be read back at the same path. Everything *outside* these three roots is invisible to the container — the old host `uvx` process could read any path, this one cannot.
 
 To expose another root, add it both in `catalog/custom.yaml` and in `MCP_GATEWAY_DOCKER_BIND_ALLOWED_PATHS` in `docker-compose.yml` — the gateway only permits host binds under a path listed there (read-write binds additionally require `MCP_GATEWAY_DOCKER_BIND_ALLOW_WRITABLE_PATHS`).
 
@@ -293,6 +305,7 @@ Or point any MCP client (Claude Desktop, AiderDesk, etc.) at `http://<host>:8812
 - **Never commit `.env`, `model-council-data/config.json`, or any runtime data.** They are git-ignored; only `config.example.json` is tracked.
 - The gateway binds to `127.0.0.1` only; the session proxy fronts it for external clients and forwards the bearer token.
 - Tor traffic from OnionClaw is routed exclusively through the `torproxy` container.
+- Playwright's browser profile is bind-mounted **read-write** from `/opt/blast/cache/ms-playwright-mcp`, so a page the browser visits can write inside that directory. The container runs with `no-new-privileges` and is capped at `--cpus 1 --memory 2Gb`, and the mount is a cache directory on `/opt` (`MCP_GATEWAY_DOCKER_BIND_ALLOW_WRITABLE_PATHS`) — keep it pointed at a directory like this one, not at a tree worth protecting.
 - Telegram notifications are one-way and confined to one chat by configuration (`TELEGRAM_CHAT_ID`); the bot token is shared with `discord-llm-bot` but is only ever used to *send*. The tools are not patched to reject a `chatId` override — see [Telegram Notify](#telegram-notify) if that guarantee ever needs to be hard.
 - `model-council-sync` mounts the Docker socket (read-only) to restart the gateway after roster changes; if the host is exposed, consider fronting it with a [docker-socket-proxy](https://github.com/Tecnativa/docker-socket-proxy) restricted to `POST /containers/*/restart`.
 - SearXNG and ChromaDB ports should be firewall-restricted if the host is exposed.
