@@ -35,6 +35,16 @@ engines:
   - name: brave
     disabled: true
 
+  # `google cse` cannot be given a key: the engine hardcodes blackle.com's
+  # public CSE id (partner-pub-8993703457585266:4862972284) and scrapes a
+  # token for it, so every SearXNG instance in the world shares one Google
+  # quota. It answers 429 on essentially every query, which only spends a
+  # request and pollutes `unresponsive_engines`. General/web is covered by
+  # bing + duckduckgo, and Brave-indexed results come from the keyed `tavily`
+  # server. Re-enable only if SearXNG ships a keyed Google engine.
+  - name: google cse
+    disabled: true
+
 outgoing:
   # Per-engine timeout: give throttled/slow upstreams a little more room
   # before SearXNG gives up on them.
