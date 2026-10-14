@@ -21,6 +21,7 @@ services:
           for image in \
             isokoliuk/mcp-searxng:latest \
             ghcr.io/aas-ee/open-web-search:latest \
+            mcp/tavily:latest \
             mcp/fetch:latest \
             mcp/chroma:latest \
             ghcr.io/oraios/serena:latest
@@ -111,6 +112,7 @@ services:
       - --catalog=/root/.docker/mcp/catalogs/custom.yaml
       - --servers=searxng
       - --servers=open-websearch
+      - --servers=tavily
       - --servers=fetch
       - --servers=chroma
       - --servers=onionclaw      

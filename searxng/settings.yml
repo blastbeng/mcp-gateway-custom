@@ -18,6 +18,23 @@ search:
     - html
     - json
 
+engines:
+  # Bing is keyless and, measured from this host, answers a plain general/web
+  # query in ~0.6s with ~10 results and no CAPTCHA -- but it ships disabled in
+  # SearXNG's defaults. Enabling it keeps general/web queries alive while
+  # DuckDuckGo is serving a CAPTCHA (which it does under sustained volume).
+  - name: bing
+    disabled: false
+
+  # The `brave` engine scrapes search.brave.com, which answers scrapers with
+  # HTTP 429 and a byte-identical anti-bot page -- from this host and from a Tor
+  # exit alike. That is bot detection, not an IP quota we could rotate around.
+  # It cannot return results; it only spends a request per query and pollutes
+  # `unresponsive_engines`. Brave-indexed results now come from the keyed
+  # `tavily` server instead. Re-enable if Brave lifts the block.
+  - name: brave
+    disabled: true
+
 outgoing:
   # Per-engine timeout: give throttled/slow upstreams a little more room
   # before SearXNG gives up on them.

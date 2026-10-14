@@ -49,6 +49,7 @@ Defined in [`catalog/custom.yaml`](catalog/custom.yaml) as a custom catalog (`lo
 |---|---|---|
 | `searxng` | Local | Web search through the local SearXNG instance |
 | `open-websearch` | Local | Self-hosted multi-engine keyword search (Bing, DuckDuckGo, Brave, Startpage, Exa, Hacker News), no API keys — robust fallback to SearXNG |
+| `tavily` | Local | Keyed search fallback (`TAVILY_API_KEY`, free tier, no card): search, extract, crawl, map, research — immune to scraper bot-detection and per-IP CAPTCHA cooldowns |
 | `chroma` | Local | Persistent semantic vector memory (project knowledge, architectural decisions, code patterns) |
 | `onionclaw` | Local | **OnionClaw / SICRY** — Tor and dark-web OSINT: multi-engine onion search, .onion fetch/crawl, engine health checks, structured OSINT export |
 | `context7` | Remote | Up-to-date, version-specific library/framework documentation ([mcp.context7.com](https://mcp.context7.com)) |
@@ -72,7 +73,11 @@ All secrets live in a `.env` file at the repo root — **it is git-ignored and m
 ```dotenv
 # Auth token required by the MCP gateway / session proxy
 MCP_GATEWAY_AUTH_TOKEN=change-me
+# Tavily Search API key (server `tavily`); free tier, no credit card
+TAVILY_API_KEY=
 ```
+
+This same file is mounted read-only into the gateway as `--secrets`, so any key added here is injected into the matching MCP server container at spawn time. A secret that is missing degrades to `<UNKNOWN>` rather than crashing the gateway, which is why the `tavily` server can be registered before a key exists.
 
 The Model Council server reads its API key from [`model-council-data/config.json`](model-council-data/config.example.json) — see below.
 
@@ -122,9 +127,30 @@ Rule knobs (per provider: `inference4free`, `groq`, `ollama-cloud`, `gemini`, `o
 
 `searxng/settings.yml` is bind-mounted read/write into the container (SearXNG regenerates/updates it at startup). Search results are cached in SQLite on the `searxng-cache` volume; the `valkey` container backs only the limiter/botdetection (currently disabled), **not** the search cache. The `outgoing` block raises the per-engine timeout so throttled upstreams still get a chance to answer.
 
+Two engine overrides in `settings.yml` back the general/web category:
+
+- **`bing` is enabled** (`disabled: false`). Bing ships disabled in SearXNG's defaults but is keyless and, measured on this host, answers a general/web query in ~0.6 s with ~10 results and no CAPTCHA. It keeps Web searches alive while DuckDuckGo is in a CAPTCHA cooldown.
+- **`brave` is disabled.** The engine scrapes `search.brave.com`, which now answers scrapers with HTTP 429 and a byte-identical anti-bot page — from this host **and** from a Tor exit, so it is bot detection rather than an IP quota we could rotate around. It cannot return results, so it only spent a request per query. Brave-indexed results come from the keyed `tavily` server instead; re-enable the engine if Brave lifts the block.
+
+Routing SearXNG's engines through the Tor proxy was evaluated and **rejected**: it buys nothing for `duckduckgo` (which answers fine from the host IP until it hits a volume-based CAPTCHA) and actively degrades `bing` (10 result blocks direct vs 0 via Tor).
+
 ### Open WebSearch
 
 `open-websearch` runs as a gateway-managed local server (`ghcr.io/aas-ee/open-web-search:latest`, `MODE=stdio`) and provides a second, independent keyword-search path when the scraped SearXNG engines throttle. Its `search` tool takes an `engines` argument (`duckduckgo`, `brave`, `startpage`, `hackernews`, `exa`); no API keys are required.
+
+It is **keyless, therefore still scraped**: it has no API-key support at all, so it shares SearXNG's upstream blocks and its `brave` engine returns the same 429. Its `duckduckgo`/`bing` lanes work; it is a second *lane*, not a different *kind* of access. For access that does not depend on scraping at all, use `tavily` below.
+
+### Tavily Search
+
+`tavily` runs as a gateway-managed local server (`mcp/tavily:latest`, stdio) and is the only search path here that is not scraping: it calls the Tavily API, so it is unaffected by bot detection or per-IP CAPTCHA cooldowns.
+
+Enable it by putting a key in `.env` (the gateway injects it from there — see [Secrets](#secrets-env)):
+
+```dotenv
+TAVILY_API_KEY=tvly-...
+```
+
+The free tier is 1,000 credits/month with **no credit card** ([app.tavily.com](https://app.tavily.com)); a basic search costs 1 credit, an advanced search 2. The server exposes `tavily_search`, `tavily_extract`, `tavily_crawl`, `tavily_map` and `tavily_research`. Until a key is set the server still registers and the gateway logs a benign `Secret 'TAVILY_API_KEY' not found` warning when the server is first spawned.
 
 ## Repository layout
 

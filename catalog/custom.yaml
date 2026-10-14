@@ -56,6 +56,20 @@ registry:
       - name: ALLOWED_SEARCH_ENGINES
         value: "duckduckgo,brave,startpage,hackernews,exa"
 
+  tavily:
+    title: Tavily Search
+    type: server
+    image: mcp/tavily:latest
+    description: >
+      Keyed fallback for when the scraped engines throttle or block. The Tavily
+      API is not subject to scraper bot-detection or per-IP CAPTCHA cooldowns,
+      so it answers when SearXNG's brave/duckduckgo/google lanes are down.
+      Provides search, extract, crawl, map and research tools.
+
+    secrets:
+      - name: TAVILY_API_KEY
+        env: TAVILY_API_KEY
+
   onionclaw:
     title: OnionClaw / SICRY
     type: server
