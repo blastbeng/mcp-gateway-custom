@@ -224,6 +224,8 @@ volumes:
 
 To expose another root, add it both in `catalog/custom.yaml` and in `MCP_GATEWAY_DOCKER_BIND_ALLOWED_PATHS` in `docker-compose.yml` — the gateway only permits host binds under a path listed there (read-write binds additionally require `MCP_GATEWAY_DOCKER_BIND_ALLOW_WRITABLE_PATHS`).
 
+The same `/tmp` share is mounted, read-only, in `telegram-notify` (its `send_document` / `send_photo` / `send_video` / `send_audio` take a local `filePath`) and in `model-council` (`materials[].path` reads a local file). `playwright` gets it **read-write**: its default output directory is the container's `/tmp`, so screenshots and downloads land on the host `/tmp` where the other two can reach them — that rw bind is why `/tmp` is also in `MCP_GATEWAY_DOCKER_BIND_ALLOW_WRITABLE_PATHS`. Playwright still restricts its own filesystem access to its workspace roots (cwd `/home/node`), so uploading a `/tmp` file through `browser_file_upload` would additionally need `--allow-unrestricted-file-access`.
+
 The Dockerfile pins `mcp<2`: the upstream package declares only `mcp>=1.0.0`, so pip would otherwise resolve the 2.x MCP SDK, which dropped the low-level `Server.list_tools()` the server still calls.
 
 ## Repository layout

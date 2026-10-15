@@ -89,6 +89,12 @@ registry:
       - name: TELEGRAM_CHAT_ID
         env: TELEGRAM_CHAT_ID
 
+    # send_document / send_photo / send_video / send_audio prendono un filePath
+    # locale: /tmp e' lo scratch condiviso con host e altri server, montato RO
+    # allo stesso percorso cosi' un file scritto altrove in /tmp si invia qui.
+    volumes:
+      - "/tmp:/tmp:ro"
+
     longLived: true
 
   onionclaw:
@@ -156,6 +162,9 @@ registry:
       - "/opt/docker/compose/mcp/model-council-data:/config:ro"
       - "/opt/projects:/opt/projects:ro"
       - "/opt/docker/compose:/opt/docker/compose:ro"
+      # materials[].path legge un file locale: /tmp montato RO come per gli
+      # altri server, cosi' un path sotto /tmp risolve identico qui.
+      - "/tmp:/tmp:ro"
 
     longLived: true
 
@@ -181,6 +190,25 @@ registry:
     # over. Host dir is owned by uid 1000, which is the container's `node` user.
     volumes:
       - "/opt/blast/cache/ms-playwright-mcp:/home/node/.cache/ms-playwright-mcp:rw"
+
+      # Playwright-MCP also keeps a "server registry" under
+      # ~/.cache/ms-playwright (it does NOT honour PLAYWRIGHT_BROWSERS_PATH,
+      # which only covers the browsers baked at /ms-playwright). Without a
+      # mount there, docker creates the missing parent /home/node/.cache as
+      # root:root and the unprivileged `node` user gets
+      # "EACCES: permission denied, mkdir '/home/node/.cache/ms-playwright'".
+      # uid 1000 on both sides, and kept on /opt so nothing lands on the
+      # small root filesystem.
+      - "/opt/blast/cache/ms-playwright:/home/node/.cache/ms-playwright:rw"
+
+      # L'output dir di default del server e' la tmpdir del container (/tmp):
+      # screenshot e download finiscono li'. Montando /tmp dell'host in RW
+      # (serve anche in MCP_GATEWAY_DOCKER_BIND_ALLOW_WRITABLE_PATHS) quei file
+      # atterrano nello scratch condiviso e sono raggiungibili da telegram-notify
+      # e local-image-reader. NB: l'accesso al filesystem resta limitato ai
+      # workspace root (cwd /home/node), quindi browser_file_upload di un path in
+      # /tmp richiederebbe anche --allow-unrestricted-file-access negli args.
+      - "/tmp:/tmp:rw"
 
     longLived: true
 

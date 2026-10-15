@@ -119,6 +119,13 @@ def _init_upstream():
 def _ensure_session(force=False):
     global _up_sid
     with _lock:
+        if force and _up_sid is not None:
+            # Release the session we are about to abandon instead of leaking
+            # it: a live upstream session keeps the gateway's long-lived child
+            # containers (chroma, telegram-notify, ...) alive, so healing
+            # without this DELETE duplicates every one of them.
+            _upstream({**CLIENT_HEADERS, "Mcp-Session-Id": _up_sid}, None,
+                      method="DELETE", timeout=30)
         if force:
             _up_sid = None
         if _up_sid is None:

@@ -140,6 +140,13 @@ services:
     mem_limit: 512m
     restart: "no"
 
+    # The gateway owns the long-lived stdio children it spawns
+    # (`docker run --rm ...`): it releases them on a graceful shutdown, so
+    # give it room to do that instead of letting the 10s docker default
+    # SIGKILL it mid-teardown — that was the source of the orphaned
+    # chroma/telegram-notify containers.
+    stop_grace_period: 90s
+
     command:
       - --transport=streaming
       - --port=8811
@@ -170,7 +177,9 @@ services:
       MCP_GATEWAY_DOCKER_BIND_ALLOWED_PATHS: "/opt/docker/compose/mcp/model-council-data:/opt/projects:/opt/docker/compose:/tmp"
       # playwright's browser profile lives on /opt (never in the container layer,
       # i.e. never in /var/lib/docker on the small root fs); rw needs this list.
-      MCP_GATEWAY_DOCKER_BIND_ALLOW_WRITABLE_PATHS: "/opt/docker/compose/mcp/chroma-data:/opt/docker/compose/mcp/chroma-cache:/opt/docker/compose/mcp/onionclaw-data:/opt/blast/cache/ms-playwright-mcp"
+      # /tmp is here for playwright's output dir (screenshots/downloads land in
+      # the shared host /tmp, rw); /tmp is already in the RO allowlist above.
+      MCP_GATEWAY_DOCKER_BIND_ALLOW_WRITABLE_PATHS: "/opt/docker/compose/mcp/chroma-data:/opt/docker/compose/mcp/chroma-cache:/opt/docker/compose/mcp/onionclaw-data:/opt/blast/cache/ms-playwright-mcp:/opt/blast/cache/ms-playwright:/tmp"
 
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
@@ -179,6 +188,15 @@ services:
 
     security_opt:
       - no-new-privileges:true
+
+    # Stop ordering: the gateway must go down *before* the backends its
+    # children talk to (chroma, searxng, torproxy), so it can release the
+    # children while those are still reachable. Compose stops in reverse
+    # dependency order, hence the gateway depends_on them.
+    depends_on:
+      - chroma
+      - searxng
+      - torproxy
 
     networks:
       - mcp
@@ -251,9 +269,11 @@ services:
   # cycles (missing, gone, or probe-fail), removes paid seats the same cycle,
   # puts repeatedly-rejected candidates on a CANDIDATE_RETRY_HOURS cooldown;
   # no member is static — anything no rule claims is dropped. Rewrites
-  # config.json only on a real change, then restarts the gateway so the
-  # council server (which reads its roster once at startup) picks it up —
-  # healed for clients by mcp-session-proxy.
+  # config.json only on a real change; the council server reads its roster
+  # live (see model-council/entrypoint.py), so RESTART_GATEWAY is off and
+  # the gateway is never bounced. Restarting it tore the whole stack down
+  # (--abort-on-container-exit) and made the gateway respawn — and leak —
+  # its long-lived stdio children.
   model-council-sync:
     image: python:3.12-alpine
     container_name: model-council-sync
@@ -274,7 +294,7 @@ services:
       CANDIDATE_RETRY_HOURS: "24"
       PROBE_ENABLED: "true"
       PROBE_WORKERS: "12"
-      RESTART_GATEWAY: "true"
+      RESTART_GATEWAY: "false"
       GATEWAY_CONTAINER: "mcp-gateway"
     security_opt:
       - no-new-privileges:true

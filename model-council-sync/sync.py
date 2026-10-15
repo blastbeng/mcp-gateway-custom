@@ -62,7 +62,7 @@ Every cycle this script:
      cycle it answers again. A paid probe removes the seat the same
      cycle (a paid model must never sit in the roster); gone/missing
      take REMOVE_AFTER_MISSES consecutive strikes first, so a transient
-     provider hiccup does not churn the roster (and restart the gateway);
+     provider hiccup does not churn the roster;
      a rule whose seats ALL come back paid — or ALL come back unknown —
      in one cycle is treated as a gateway-wide failure, not as N dead
      models (circuit breaker);
@@ -75,10 +75,12 @@ Every cycle this script:
      moment it answers. Nothing is permanent: every rejection is undone
      the cycle the model answers again;
   4. rewrites config.json atomically (previous copy kept as .bak) only when
-     something actually changed, and then restarts the gateway so the
-     council server — which reads its roster once at startup — picks the
-     new roster up. The session proxy heals client sessions across that
-     restart, so callers never see it.
+     something actually changed. The council server reads its roster live
+     (its image wraps the entrypoint to re-read the config on mtime change),
+     so the gateway is NOT restarted: RESTART_GATEWAY is off by default in
+     the compose service. Restarting it used to tear the whole stack down
+     (--abort-on-container-exit) and make the gateway respawn, and leak, its
+     long-lived stdio children.
 
 Credentials come from the config's own providers.litellm block — no new
 secrets — and can be overridden with LITELLM_BASE_URL / LITELLM_API_KEY.
@@ -667,7 +669,7 @@ def sync_cycle() -> None:
     if RESTART_GATEWAY:
         restart_gateway()
     else:
-        log("RESTART_GATEWAY=false — restart the gateway manually to apply")
+        log("RESTART_GATEWAY=false — the council reads config.json live, nothing to restart")
 
 
 def main() -> None:
