@@ -163,7 +163,8 @@ registry:
       - "/opt/projects:/opt/projects:ro"
       - "/opt/docker/compose:/opt/docker/compose:ro"
       # materials[].path legge un file locale: /tmp montato RO come per gli
-      # altri server, cosi' un path sotto /tmp risolve identico qui.
+      # altri server (questo container gira come root), cosi' un path sotto
+      # /tmp risolve identico qui.
       - "/tmp:/tmp:ro"
 
     longLived: true
@@ -171,7 +172,7 @@ registry:
   playwright:
     title: Playwright
     type: server
-    image: mcp/playwright:latest
+    image: playwright-mcp:latest
     description: >
       Headless browser automation (Chromium) from Microsoft's Playwright MCP:
       navigate, snapshot, click, type, screenshot, evaluate and inspect network
@@ -179,7 +180,22 @@ registry:
       process, so it no longer depends on the host Node runtime. Chromium
       itself is baked into the image; the persistent browser profile is
       bind-mounted from /opt so it stays off the (small) root filesystem and
-      survives gateway restarts.
+      survives gateway restarts. `playwright-mcp:latest` is a thin wrapper on
+      mcp/playwright:latest (see playwright/) that clears the stale Chromium
+      SingletonLock a previous container leaves in the profile.
+
+    # Playwright-MCP limita l'accesso al filesystem a due "allowed roots":
+    # l'output dir e la cwd (workspace root, /home/node). Senza override
+    # l'output dir e' <cwd>/.playwright-mcp, quindi un path in /tmp viene
+    # rifiutato con "File access denied ... outside allowed roots". Portandola
+    # a /tmp, /tmp diventa una root ammessa (upload/drop e nomi di file
+    # espliciti sotto /tmp funzionano) SENZA --allow-unrestricted-file-access,
+    # che invece aprirebbe tutto il filesystem. Inoltre gli output senza nome
+    # (screenshot, snapshot) finiscono nello /tmp condiviso, dove li vedono
+    # telegram-notify e local-image-reader.
+    env:
+      - name: PLAYWRIGHT_MCP_OUTPUT_DIR
+        value: "/tmp"
 
     # Chromium ships inside the image (PLAYWRIGHT_BROWSERS_PATH=/ms-playwright),
     # but the persistent profile does not: the server writes it to
@@ -201,13 +217,11 @@ registry:
       # small root filesystem.
       - "/opt/blast/cache/ms-playwright:/home/node/.cache/ms-playwright:rw"
 
-      # L'output dir di default del server e' la tmpdir del container (/tmp):
-      # screenshot e download finiscono li'. Montando /tmp dell'host in RW
-      # (serve anche in MCP_GATEWAY_DOCKER_BIND_ALLOW_WRITABLE_PATHS) quei file
-      # atterrano nello scratch condiviso e sono raggiungibili da telegram-notify
-      # e local-image-reader. NB: l'accesso al filesystem resta limitato ai
-      # workspace root (cwd /home/node), quindi browser_file_upload di un path in
-      # /tmp richiederebbe anche --allow-unrestricted-file-access negli args.
+      # /tmp resta lo scratch condiviso: e' l'output dir del server (vedi
+      # PLAYWRIGHT_MCP_OUTPUT_DIR sopra), quindi screenshot e download
+      # atterrano sullo /tmp dell'host e sono raggiungibili da telegram-notify
+      # e local-image-reader. Il mount rw richiede /tmp anche in
+      # MCP_GATEWAY_DOCKER_BIND_ALLOW_WRITABLE_PATHS.
       - "/tmp:/tmp:rw"
 
     longLived: true

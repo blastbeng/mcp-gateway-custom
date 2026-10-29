@@ -37,8 +37,8 @@ A self-hosted, Docker Compose-based stack that runs the [Docker MCP Gateway](htt
 | `searxng` | `searxng/searxng:latest` | Privacy-respecting metasearch engine, used by the SearXNG MCP server |
 | `valkey` | `valkey/valkey:9-alpine` | Limiter/botdetection backend for SearXNG (disabled); search results are cached in SQLite on the `searxng-cache` volume |
 | `chroma` | `chromadb/chroma:latest` | ChromaDB vector store, used by the Chroma MCP server for persistent semantic memory |
-| `torproxy` | `dperson/torproxy` | SOCKS5 (9050) + HTTP (8118) Tor proxy, used by OnionClaw |
-| `mcp-image-checker` | `docker:cli` | Cron-like sidecar (hourly) that pulls required images and rebuilds the four locally built MCP server images if missing |
+| `torproxy` | `torproxy:latest` (local build, `torproxy/`) | SOCKS5 (9050) + HTTP (8118) Tor proxy, used by OnionClaw. Built on Alpine with Tor 0.4.9: `dperson/torproxy` is frozen at Tor 0.4.4, which the network rejects (`Desc=3`/`Microdesc=3`) |
+| `mcp-image-checker` | `docker:cli` | Cron-like sidecar (hourly) that pulls required images and rebuilds the locally built images (MCP servers + `torproxy`) if missing |
 | `model-council-sync` | `python:3.12-alpine` | Keeps the council roster in step with LiteLLM (all `inference4free` models, free-only OpenRouter models incl. the `openrouter/free` alias, small+free Groq/Ollama/Gemini): every seat is probe-verified before joining and re-probed while seated; drops vanished, paid, or repeatedly-failing seats; no static members — anything no rule claims is dropped; restarts the gateway only when the roster actually changed |
 
 ### MCP servers registered in the gateway
@@ -66,8 +66,9 @@ Defined in [`catalog/custom.yaml`](catalog/custom.yaml) as a custom catalog (`lo
 | [`model-council/`](model-council/) | `model-council-mcp:latest` | Thin wrapper: installs the `model-council-mcp` PyPI package |
 | [`telegram-notify/`](telegram-notify/) | `telegram-notify-mcp:latest` | Thin wrapper on `node:22-alpine`: installs the `telegram-notifier-mcp` npm package (pinned) |
 | [`local-image-reader/`](local-image-reader/) | `local-image-reader-mcp:latest` | Thin wrapper on `python:3.12-slim`: installs the `mcp-local-image-reader` PyPI package (pinned, `mcp<2`) |
+| [`playwright/`](playwright/) | `playwright-mcp:latest` | Thin wrapper on `mcp/playwright:latest`: clears the stale Chromium `SingletonLock` before exec |
 
-All four are built automatically by the `mcp-image-checker` sidecar when missing (or run manually: `docker build -t local-image-reader-mcp:latest ./local-image-reader`). `node:22-alpine` is on the sidecar's pull list and, like these images, is in `PROTECTED_IMAGES` of `/usr/local/bin/manage-docker` so the monthly cleanup never deletes the base image the build needs. `mcp/playwright:latest` is likewise pulled by the sidecar and in `PROTECTED_IMAGES`.
+All five are built automatically by the `mcp-image-checker` sidecar when missing (or run manually: `docker build -t local-image-reader-mcp:latest ./local-image-reader`). The base images they need (`node:22-alpine`, `mcp/playwright:latest`) are on the sidecar's pull list and, like these images, are in `PROTECTED_IMAGES` of `/usr/local/bin/manage-docker` so the monthly cleanup never deletes an image a build depends on.
 
 ## Configuration
 
@@ -194,18 +195,22 @@ curl -s -X POST http://localhost:8811/mcp \
 
 ### Playwright
 
-`playwright` is Microsoft's [Playwright MCP](https://github.com/microsoft/playwright-mcp) (`mcp/playwright:latest`) run as a gateway-managed container instead of the host `npx @playwright/mcp` process AiderDesk used to spawn. It drives headless Chromium — `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_take_screenshot`, `browser_evaluate`, `browser_network_requests` and the rest (23 tools).
+`playwright` is Microsoft's [Playwright MCP](https://github.com/microsoft/playwright-mcp) run as a gateway-managed container instead of the host `npx @playwright/mcp` process AiderDesk used to spawn. It drives headless Chromium — `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_take_screenshot`, `browser_evaluate`, `browser_network_requests` and the rest (23 tools). The catalog entry is `image: playwright-mcp:latest` with `longLived: true`, so the gateway keeps one long-lived child and every client session reuses that same browser. Chromium stays inside the container, so there is still no host Node/npx dependency: the gateway starts it with `--init` (which reaps the Chromium process tree) and caps it at `--cpus 1 --memory 2Gb`, and the image is ~1.7 GB — hence its place on the `mcp-image-checker` pull list and in `PROTECTED_IMAGES` of `/usr/local/bin/manage-docker`.
 
-Running it in the gateway drops the host Node/npx dependency and keeps Chromium inside the container: the gateway starts it with `--init` (which reaps the Chromium process tree) and caps it at `--cpus 1 --memory 2Gb`. The image is ~1.7 GB, so it is on the `mcp-image-checker` pull list and in `PROTECTED_IMAGES` of `/usr/local/bin/manage-docker`.
+**One server, one browser.** Playwright keeps a persistent Chromium profile guarded by `~/.cache/ms-playwright-mcp/*/SingletonLock` (a `<hostname>-<pid>` symlink), and its `isProfileLocked()` only checks `kill(pid, 0)`. Inside a fresh container that check is meaningless: the lock was written by the previous container, but Chromium's PIDs are low and the new PID namespace recycles them, so the pid exists again and startup aborts with `Browser is already in use ... use --isolated`.
+
+**Why a wrapper image.** `playwright-mcp:latest` ([`playwright/`](playwright/)) is `mcp/playwright:latest` plus an entrypoint that deletes `SingletonLock` / `SingletonCookie` / `SingletonSocket` from every `~/.cache/ms-playwright-mcp/*/` and then `exec`s the base image's own `node /app/cli.js --headless --browser chromium --no-sandbox "$@"`. The lock left behind by a dead container is stale by definition, so clearing it is safe; Chromium's own `ProcessSingleton` still guards against a genuinely concurrent second instance on the same profile.
 
 **The browser profile lives on the host, not in the container.** Chromium itself is baked into the image (`PLAYWRIGHT_BROWSERS_PATH=/ms-playwright`), but the persistent profile is not — the server writes it to `$HOME/.cache/ms-playwright-mcp` (`HOME=/home/node`, uid 1000), which would otherwise end up in the container's writable layer, i.e. inside `/var/lib/docker` on the host's **root** filesystem. On this host `/` is the small filesystem (117 GB, ~23 GB free, 56 GB already in `/var/lib/docker`) while `/opt` is the big one (453 GB), so the profile is bind-mounted read-write from `/opt`:
 
 ```yaml
 volumes:
   - "/opt/blast/cache/ms-playwright-mcp:/home/node/.cache/ms-playwright-mcp:rw"
+  - "/opt/blast/cache/ms-playwright:/home/node/.cache/ms-playwright:rw"
+  - "/tmp:/tmp:rw"
 ```
 
-The host directory is owned by uid 1000, which is the container's `node` user, so no chown is needed; write access requires the path in `MCP_GATEWAY_DOCKER_BIND_ALLOW_WRITABLE_PATHS`. Note that the profile **directory name follows the browser build** baked into the image (`mcp-chrome-for-testing-<hash>`), so profiles written by a different Playwright version sit in sibling directories rather than being reused.
+The first two host directories are owned by uid 1000, which is the container's `node` user, so no chown is needed. The second one exists because the server's browser *registry* ignores `PLAYWRIGHT_BROWSERS_PATH`; without the mount Docker creates the missing parent `/home/node/.cache` as `root:root` and the unprivileged `node` user fails with `EACCES: permission denied, mkdir '/home/node/.cache/ms-playwright'`. The container is spawned by the gateway, so all three binds must also appear in `MCP_GATEWAY_DOCKER_BIND_ALLOWED_PATHS` (read-write ones in `MCP_GATEWAY_DOCKER_BIND_ALLOW_WRITABLE_PATHS`) in `docker-compose.yml`. Note that the profile **directory name follows the browser build** baked into the image (`mcp-chrome-for-testing-<hash>`), so profiles written by a different Playwright version sit in sibling directories rather than being reused.
 
 ### Local Image Reader
 
@@ -224,7 +229,9 @@ volumes:
 
 To expose another root, add it both in `catalog/custom.yaml` and in `MCP_GATEWAY_DOCKER_BIND_ALLOWED_PATHS` in `docker-compose.yml` — the gateway only permits host binds under a path listed there (read-write binds additionally require `MCP_GATEWAY_DOCKER_BIND_ALLOW_WRITABLE_PATHS`).
 
-The same `/tmp` share is mounted, read-only, in `telegram-notify` (its `send_document` / `send_photo` / `send_video` / `send_audio` take a local `filePath`) and in `model-council` (`materials[].path` reads a local file). `playwright` gets it **read-write**: its default output directory is the container's `/tmp`, so screenshots and downloads land on the host `/tmp` where the other two can reach them — that rw bind is why `/tmp` is also in `MCP_GATEWAY_DOCKER_BIND_ALLOW_WRITABLE_PATHS`. Playwright still restricts its own filesystem access to its workspace roots (cwd `/home/node`), so uploading a `/tmp` file through `browser_file_upload` would additionally need `--allow-unrestricted-file-access`.
+The same `/tmp` share is mounted, read-only, in `telegram-notify` (its `send_document` / `send_photo` / `send_video` / `send_audio` take a local `filePath`) and in `model-council` (`materials[].path` reads a local file). `playwright` gets it **read-write**: its output directory is `/tmp`, so screenshots and downloads land on the host `/tmp` where the other two can reach them — that rw bind is why `/tmp` is also in `MCP_GATEWAY_DOCKER_BIND_ALLOW_WRITABLE_PATHS`.
+
+Playwright-MCP restricts its own filesystem access to two **allowed roots**: its output directory and its workspace root (`cwd`, `/home/node`). The output directory is set to `/tmp` via `PLAYWRIGHT_MCP_OUTPUT_DIR`, which makes `/tmp` an allowed root — `browser_file_upload`, `browser_drop` and explicit filenames under `/tmp` work **without** `--allow-unrestricted-file-access` (that flag would open the whole filesystem instead of just adding `/tmp`). Auto-named outputs (snapshots, unnamed screenshots) go to that output dir; a *relative* filename is resolved against the workspace root instead, so pass an absolute `/tmp/...` path when the file has to be visible to `telegram-notify` or `local-image-reader`.
 
 The Dockerfile pins `mcp<2`: the upstream package declares only `mcp>=1.0.0`, so pip would otherwise resolve the 2.x MCP SDK, which dropped the low-level `Server.list_tools()` the server still calls.
 
@@ -246,6 +253,9 @@ The Dockerfile pins `mcp<2`: the upstream package declares only `mcp>=1.0.0`, so
 │   └── sync.py              # Auto-sync of dynamic council seats (rules engine)
 ├── onionclaw/
 │   └── Dockerfile           # Builds onionclaw-mcp:latest
+├── playwright/
+│   ├── Dockerfile           # Builds playwright-mcp:latest (wrapper on mcp/playwright)
+│   └── entrypoint.sh        # Clears the stale Chromium SingletonLock
 ├── onionclaw-data/          # SICRY SQLite DB (git-ignored)
 ├── chroma-data/             # ChromaDB persistence (git-ignored)
 ├── chroma-cache/            # ChromaDB/HNSW cache (git-ignored)

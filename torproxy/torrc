@@ -1,0 +1,14 @@
+# Tor SOCKS5 listener consumed by OnionClaw (TOR_SOCKS_HOST=torproxy).
+SocksPort 0.0.0.0:9050
+SocksPolicy accept *
+
+DataDirectory /var/lib/tor
+User tor
+
+# Client only: this container never relays.
+ClientOnly 1
+AvoidDiskWrites 1
+
+# Log lines come from the command line: entrypoint.sh passes
+#   --Log "${TOR_LOG_LEVEL} stderr"
+# so the log level stays configurable through the compose environment.

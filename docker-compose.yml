@@ -11,6 +11,8 @@ services:
       - ./model-council:/opt/model-council:ro
       - ./telegram-notify:/opt/telegram-notify:ro
       - ./local-image-reader:/opt/local-image-reader:ro
+      - ./playwright:/opt/playwright:ro
+      - ./torproxy:/opt/torproxy:ro
     environment:
       CHECK_INTERVAL: "3600"
     command:
@@ -84,6 +86,21 @@ services:
               || echo "ERROR building telegram-notify-mcp:latest"
           fi
 
+          echo "--- Playwright MCP (stale-lock wrapper on mcp/playwright) ---"
+
+          if docker image inspect playwright-mcp:latest >/dev/null 2>&1; then
+            echo "OK: playwright-mcp:latest"
+          else
+            echo "MISSING: playwright-mcp:latest"
+            echo "Building playwright-mcp:latest..."
+
+            docker build \
+              --pull \
+              -t playwright-mcp:latest \
+              /opt/playwright \
+              || echo "ERROR building playwright-mcp:latest"
+          fi
+
           echo "--- Local Image Reader MCP ---"
 
           if docker image inspect local-image-reader-mcp:latest >/dev/null 2>&1; then
@@ -99,18 +116,40 @@ services:
               || echo "ERROR building local-image-reader-mcp:latest"
           fi
 
+          echo "--- torproxy (local build, Tor >= 0.4.8) ---"
+
+          if docker image inspect torproxy:latest >/dev/null 2>&1; then
+            echo "OK: torproxy:latest"
+          else
+            echo "MISSING: torproxy:latest"
+            echo "Building torproxy:latest..."
+
+            docker build \
+              --pull \
+              -t torproxy:latest \
+              /opt/torproxy \
+              || echo "ERROR building torproxy:latest"
+          fi
+
           echo "Next check in $${CHECK_INTERVAL}s"
           sleep "$${CHECK_INTERVAL}"
         done
 
+  # Locally built (see torproxy/Dockerfile) because dperson/torproxy:latest is
+  # frozen at Tor 0.4.4.8 (2021): the Tor network now requires the Desc=3 /
+  # Microdesc=3 descriptor protocols (Tor >= 0.4.8), so that image failed
+  # bootstrapping and exited with status 1 after ~120s. Under
+  # `up --abort-on-container-exit` each exit restarted the whole stack
+  # (~2.5 min cycles, 166 restarts) and leaked a new set of gateway stdio
+  # children (chroma-mcp, ...) every time.
   torproxy:
-    image: dperson/torproxy:latest
+    image: torproxy:latest
+    build: ./torproxy
     container_name: torproxy
     mem_limit: 256m
     restart: no
 
     environment:
-      TORUSER: root
       TOR_LOG_LEVEL: err
 
     ports:
@@ -129,7 +168,9 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
-      start_period: 60s
+      # A cold Tor client needs ~2 min on this Pi to reach 100%, so do not
+      # flag the container unhealthy before then.
+      start_period: 180s
 
     networks:
       - mcp
