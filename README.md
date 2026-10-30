@@ -38,7 +38,9 @@ A self-hosted, Docker Compose-based stack that runs the [Docker MCP Gateway](htt
 | `valkey` | `valkey/valkey:9-alpine` | Limiter/botdetection backend for SearXNG (disabled); search results are cached in SQLite on the `searxng-cache` volume |
 | `chroma` | `chromadb/chroma:latest` | ChromaDB vector store, used by the Chroma MCP server for persistent semantic memory |
 | `torproxy` | `torproxy:latest` (local build, `torproxy/`) | SOCKS5 (9050) + HTTP (8118) Tor proxy, used by OnionClaw. Built on Alpine with Tor 0.4.9: `dperson/torproxy` is frozen at Tor 0.4.4, which the network rejects (`Desc=3`/`Microdesc=3`) |
-| `mcp-image-checker` | `docker:cli` | Cron-like sidecar (hourly) that pulls required images and rebuilds the locally built images (MCP servers + `torproxy`) if missing |
+| `mcp-image-checker` | `docker:cli` | Cron-like sidecar (hourly) that pulls required images and rebuilds the locally built images (MCP servers + `torproxy` + `klaket-*`) if missing |
+| `klaket-api` | `klaket-api:latest` (local build, `klaket/`) | Klaket job API (Go): accepts ingest requests, queues them on Redis, serves status/result/export |
+| `klaket-worker` | `klaket-worker:latest` (local build, `klaket/`) | Offline media pipeline: ffmpeg + faster-whisper + sherpa-onnx diarization + OpenCV scenes + OCR. No torch |
 | `model-council-sync` | `python:3.12-alpine` | Keeps the council roster in step with LiteLLM (all `inference4free` models, free-only OpenRouter models incl. the `openrouter/free` alias, small+free Groq/Ollama/Gemini): every seat is probe-verified before joining and re-probed while seated; drops vanished, paid, or repeatedly-failing seats; no static members — anything no rule claims is dropped; restarts the gateway only when the roster actually changed |
 
 ### MCP servers registered in the gateway
@@ -57,6 +59,7 @@ Defined in [`catalog/custom.yaml`](catalog/custom.yaml) as a custom catalog (`lo
 | `model-council` | Local | Multi-model "AI council" backed by LiteLLM: second opinions, code review, architecture advice, multi-model synthesis |
 | `playwright` | Local | Headless Chromium browser automation (Microsoft Playwright MCP): navigate, snapshot, click, type, screenshot, evaluate, inspect network — runs as a gateway container instead of a host `npx` process |
 | `local-image-reader` | Local | Reads a local image file and returns it as base64 `ImageContent` for a vision-capable client model (single tool: `read_image`) |
+| `klaket` | Local | **Klaket** — offline audio/video analysis: transcript with word timestamps and speaker labels, language detection, scenes/keyframes, OCR, SRT/VTT, in-video search. Tools: `klaket_ingest`, `klaket_job_status`, `klaket_get_result`, `klaket_find_moment` |
 
 ### Locally built MCP images
 
@@ -67,8 +70,9 @@ Defined in [`catalog/custom.yaml`](catalog/custom.yaml) as a custom catalog (`lo
 | [`telegram-notify/`](telegram-notify/) | `telegram-notify-mcp:latest` | Thin wrapper on `node:22-alpine`: installs the `telegram-notifier-mcp` npm package (pinned) |
 | [`local-image-reader/`](local-image-reader/) | `local-image-reader-mcp:latest` | Thin wrapper on `python:3.12-slim`: installs the `mcp-local-image-reader` PyPI package (pinned, `mcp<2`) |
 | [`playwright/`](playwright/) | `playwright-mcp:latest` | Thin wrapper on `mcp/playwright:latest`: clears the stale Chromium `SingletonLock` before exec |
+| [`klaket/`](klaket/) | `klaket-api:latest`, `klaket-worker:latest`, `klaket-mcp:latest` | Three images from the pinned upstream tag `v0.7.1` ([huseyinstif/klaket](https://github.com/huseyinstif/klaket)): Go API, Python worker, stdio MCP server |
 
-All five are built automatically by the `mcp-image-checker` sidecar when missing (or run manually: `docker build -t local-image-reader-mcp:latest ./local-image-reader`). The base images they need (`node:22-alpine`, `mcp/playwright:latest`) are on the sidecar's pull list and, like these images, are in `PROTECTED_IMAGES` of `/usr/local/bin/manage-docker` so the monthly cleanup never deletes an image a build depends on.
+All of them are built automatically by the `mcp-image-checker` sidecar when missing (or run manually, e.g. `docker build -t local-image-reader-mcp:latest ./local-image-reader` — Klaket: `docker build -f klaket/worker.Dockerfile -t klaket-worker:latest ./klaket`). The base images they need (`node:22-alpine`, `golang:1.23-alpine`, `python:3.12-slim`, `alpine:3.20`, `mcp/playwright:latest`) are on the sidecar's pull list and, like these images, are in `PROTECTED_IMAGES` of `/usr/local/bin/manage-docker` so the monthly cleanup never deletes an image a build depends on.
 
 ## Configuration
 
@@ -235,6 +239,33 @@ Playwright-MCP restricts its own filesystem access to two **allowed roots**: its
 
 The Dockerfile pins `mcp<2`: the upstream package declares only `mcp>=1.0.0`, so pip would otherwise resolve the 2.x MCP SDK, which dropped the low-level `Server.list_tools()` the server still calls.
 
+### Klaket
+
+`klaket` turns audio and video files into LLM-ready data **fully offline**: timestamped transcript with speaker labels, detected language, scenes + keyframes, on-screen text (OCR), SRT/VTT export and in-video search. No cloud, no API keys, no GPU. Source is [huseyinstif/klaket](https://github.com/huseyinstif/klaket), pinned to tag `v0.7.1` in all three Dockerfiles.
+
+Upstream is a four-part application; here it is three containers plus the gateway-spawned MCP server:
+
+| Piece | Container | Role |
+|---|---|---|
+| REST API | `klaket-api` (Go) | `POST /v1/ingest`, job status/result/export, `/healthz` |
+| Queue | *shared Redis* | jobs state — **db 3** of the host instance in `/opt/docker/compose/redis`, reached via `host.docker.internal:6379`; db0/db1/db2 belong to other services |
+| Worker | `klaket-worker` (Python) | ffmpeg + faster-whisper + sherpa-onnx diarization + OpenCV scenes + rapidocr |
+| MCP server | spawned by the gateway | `klaket-mcp:latest`, stdio client of the API (`KLAKET_API_URL`) |
+
+Upstream hardcodes Redis database 0; both Dockerfiles patch in a `REDIS_DB` env var and **fail the build** if the patch stops applying. The shared Redis has no password — if one is ever added, this needs a further small patch (`REDIS_ADDR` carries host:port only).
+
+Usage is asynchronous:
+
+1. `klaket_ingest` with `url` — a link **or a path visible to the worker** (`/tmp`, `/opt/projects`, `/opt/docker/compose`, all read-only). Prefer `/opt/projects` for real footage: `/tmp` is a 4 GB tmpfs, i.e. RAM.
+2. `klaket_job_status` until `done` (the worker logs `stage`/`progress`).
+3. `klaket_get_result` for markdown (transcript, chapters, scenes, OCR) or `klaket_find_moment` to search inside it.
+
+Artifacts land in `/opt/docker/compose/mcp/klaket-data` (with `TMPDIR=/data/tmp`); models in `/opt/docker/compose/mcp/klaket-models` — both on `/opt`, never in `/var/lib/docker` on the small root filesystem. First job downloads whisper `small` (~600 MB) and the sherpa-onnx diarization models (~40 MB); afterwards it is fully offline.
+
+Settings live in `docker-compose.yml` under `klaket-worker`: `WHISPER_MODEL` = `${KLAKET_WHISPER_MODEL:-small}` (override in `.env` with `tiny|base|small|medium|large-v3`), `KLAKET_OCR=on`, `KLAKET_DIARIZE=on`, `KLAKET_VLM=off`, `KLAKET_MAX_DURATION=7200` (jobs longer than 2 h are rejected) and `OMP_NUM_THREADS=2`. Budget **1–3 hours of CPU per hour of media** on this Pi; the worker is capped at 3 GB and will swap.
+
+Scope: speaker labels are **anonymous** (`S1`, `S2`, …) and consistent within one job. This is transcription + diarization — not voiceprint/identification and not emotion analysis. Argos translation is deliberately not installed (it would pull torch, spacy and stanza for a feature the MCP server does not expose).
+
 ## Repository layout
 
 ```
@@ -268,6 +299,12 @@ The Dockerfile pins `mcp<2`: the upstream package declares only `mcp>=1.0.0`, so
 │   └── Dockerfile           # Builds telegram-notify-mcp:latest
 ├── local-image-reader/
 │   └── Dockerfile           # Builds local-image-reader-mcp:latest
+├── klaket/
+│   ├── api.Dockerfile       # Builds klaket-api:latest (Go, upstream v0.7.1)
+│   ├── worker.Dockerfile    # Builds klaket-worker:latest (ffmpeg + whisper + sherpa-onnx)
+│   └── mcp.Dockerfile       # Builds klaket-mcp:latest (stdio client of the API)
+├── klaket-data/             # Klaket job artifacts (git-ignored)
+├── klaket-models/           # Klaket model cache (git-ignored)
 ├── docker-compose.yml       # Full stack definition
 └── .env                     # Secrets (git-ignored)
 ```
@@ -289,7 +326,10 @@ echo "MCP_GATEWAY_AUTH_TOKEN=$(openssl rand -hex 32)" >> .env
 cp model-council-data/config.example.json model-council-data/config.json
 # edit model-council-data/config.json with your LiteLLM URL + key
 
-docker compose build          # builds onionclaw-mcp, model-council-mcp, telegram-notify-mcp and local-image-reader-mcp
+docker compose build          # builds onionclaw-mcp, model-council-mcp, telegram-notify-mcp, local-image-reader-mcp, playwright-mcp and torproxy
+# klaket-api/worker/mcp have no `build:` stanza (one source tree, three targets):
+# the mcp-image-checker builds them on its first pass, or build them by hand:
+#   for f in api worker mcp; do docker build -f klaket/$f.Dockerfile -t klaket-$f:latest ./klaket; done
 docker compose up -d
 ```
 

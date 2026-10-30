@@ -243,3 +243,31 @@ registry:
       - "/tmp:/tmp:ro"
 
     longLived: true
+
+  klaket:
+    title: Klaket
+    type: server
+    image: klaket-mcp:latest
+    description: >
+      Offline audio/video analysis, no cloud and no API keys: transcript with
+      word timestamps and speaker labels (faster-whisper + sherpa-onnx
+      diarization), language detection, scenes + keyframes, on-screen text
+      (OCR), SRT/VTT export and in-video search. Tools: klaket_ingest,
+      klaket_job_status, klaket_get_result, klaket_find_moment — ingest is
+      asynchronous: poll status, then read the result.
+
+      This container is only the stdio client: it queues jobs on the
+      `klaket-api` service and immediately returns a job id. The media is
+      fetched and processed by `klaket-worker` (ffmpeg + faster-whisper), so
+      `url` may be a link OR a local path that the WORKER can see —
+      /tmp, /opt/projects and /opt/docker/compose are bind-mounted read-only
+      there. Prefer /opt/projects for real footage: /tmp is a 4 GB tmpfs
+      (i.e. RAM). Speaker labels are anonymous (S1, S2, ...) and consistent
+      within one job; this is transcription + diarization, not voiceprint or
+      emotion analysis.
+
+    env:
+      - name: KLAKET_API_URL
+        value: "http://klaket-api:8484"
+
+    longLived: true

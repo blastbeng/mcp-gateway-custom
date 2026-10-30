@@ -13,6 +13,7 @@ services:
       - ./local-image-reader:/opt/local-image-reader:ro
       - ./playwright:/opt/playwright:ro
       - ./torproxy:/opt/torproxy:ro
+      - ./klaket:/opt/klaket:ro
     environment:
       CHECK_INTERVAL: "3600"
     command:
@@ -30,6 +31,9 @@ services:
             mcp/chroma:latest \
             mcp/playwright:latest \
             node:22-alpine \
+            golang:1.23-alpine \
+            python:3.12-slim \
+            alpine:3.20 \
             ghcr.io/oraios/serena:latest
           do
             if docker image inspect "$$image" >/dev/null 2>&1; then
@@ -116,6 +120,24 @@ services:
               || echo "ERROR building local-image-reader-mcp:latest"
           fi
 
+          echo "--- Klaket (offline audio/video) ---"
+
+          for img in klaket-api klaket-worker klaket-mcp; do
+            if docker image inspect "$$img:latest" >/dev/null 2>&1; then
+              echo "OK: $$img:latest"
+            else
+              echo "MISSING: $$img:latest"
+              echo "Building $$img:latest..."
+
+              docker build \
+                --pull \
+                -t "$$img:latest" \
+                -f "/opt/klaket/$${img#klaket-}.Dockerfile" \
+                /opt/klaket \
+                || echo "ERROR building $$img:latest"
+            fi
+          done
+
           echo "--- torproxy (local build, Tor >= 0.4.8) ---"
 
           if docker image inspect torproxy:latest >/dev/null 2>&1; then
@@ -175,6 +197,117 @@ services:
     networks:
       - mcp
 
+  # Klaket — offline audio/video analysis (transcript, speaker labels, scenes,
+  # on-screen text, SRT/VTT). Upstream ships four parts: a Go API, a Redis
+  # queue, a Python worker and a stdio MCP server. Here there are three
+  # containers — the MCP server is not a compose service: the gateway spawns
+  # `klaket-mcp:latest` from the catalog and reaches the API on the ai-mcp
+  # network by service name. Dashboard and Argos translation are left out.
+  #
+  # Redis is NOT part of this project: Klaket uses the host-wide instance
+  # already running from /opt/docker/compose/redis on 6379 (published on
+  # 0.0.0.0), reached through host.docker.internal. That instance is shared,
+  # so Klaket gets **db 3** (db0/db1/db2 are already in use by other
+  # services). Upstream hardcodes database 0; both Dockerfiles patch
+  # REDIS_DB in, and fail the build if the patch stops applying. The instance
+  # has no password: if one is ever added, REDIS_ADDR alone cannot carry it
+  # and this needs another (small) patch.
+  klaket-api:
+    image: klaket-api:latest
+    container_name: klaket-api
+    mem_limit: 128m
+    restart: unless-stopped
+
+    environment:
+      # Shared Redis, separate DB — see the note above.
+      REDIS_ADDR: host.docker.internal:6379
+      REDIS_DB: "3"
+      DATA_DIR: /data
+      KLAKET_AUTH: "off"
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    volumes:
+      # Jobs metadata lives in Redis; artifacts (result.json, subtitles,
+      # keyframes) are written by the worker into the same bind mount.
+      - /opt/docker/compose/mcp/klaket-data:/data:rw
+      # Local media is read by the WORKER, but the API hands the path through
+      # unchanged: mounting the same roots read-only keeps path validation and
+      # any future preview honest. Same paths as local-image-reader.
+      - /tmp:/tmp:ro
+      - /opt/projects:/opt/projects:ro
+      - /opt/docker/compose:/opt/docker/compose:ro
+
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8484/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+    networks:
+      - mcp
+
+  klaket-worker:
+    image: klaket-worker:latest
+    container_name: klaket-worker
+    # 3 GB is the ceiling, not the reservation: `small` int8 + sherpa-onnx
+    # diarization + OCR peaks around 1.5-2 GB. Combined with the other
+    # services on this 8 GB host the kernel will swap during a job — that is
+    # expected, and the reason KLAKET_MAX_DURATION exists.
+    mem_limit: 3g
+    restart: unless-stopped
+
+    environment:
+      REDIS_ADDR: host.docker.internal:6379
+      REDIS_DB: "3"
+      DATA_DIR: /data
+
+      # `small` (~600-800 MB RSS) is the agreed default: noticeably better
+      # Italian than base, at roughly 0.3-0.5x realtime on the Pi's CPU.
+      # Override with KLAKET_WHISPER_MODEL in .env without editing this file.
+      WHISPER_MODEL: ${KLAKET_WHISPER_MODEL:-small}
+      WHISPER_DEVICE: cpu
+      WHISPER_COMPUTE: int8
+
+      KLAKET_OCR: "on"
+      KLAKET_DIARIZE: "on"
+      KLAKET_DIARIZE_THRESHOLD: "0.8"
+      # 0 = unlimited. 7200 s rejects anything longer instead of letting a
+      # 3-hour job hold the worker (and the swap) for a whole day.
+      KLAKET_MAX_DURATION: "7200"
+      # Scene descriptions need an LLM (ollama/openai): off, fully offline.
+      KLAKET_VLM: "off"
+
+      # All model caches on the bind mount, never in the writable layer.
+      KLAKET_MODEL_DIR: /models
+      HF_HOME: /models
+      XDG_DATA_HOME: /models
+
+      # ffmpeg/yt-dlp scratch must be writable; /tmp is read-only below
+      # because it is the shared input scratch with the other MCP servers.
+      TMPDIR: /data/tmp
+
+      # Leave a core for the rest of the stack (gateway, litellm, ...).
+      OMP_NUM_THREADS: "2"
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    volumes:
+      - /opt/docker/compose/mcp/klaket-data:/data:rw
+      - /opt/docker/compose/mcp/klaket-models:/models:rw
+      # Media the agent already knows the path of, read-only at the same path.
+      # Prefer /opt/projects over /tmp for real footage: /tmp is a 4 GB tmpfs,
+      # i.e. RAM.
+      - /tmp:/tmp:ro
+      - /opt/projects:/opt/projects:ro
+      - /opt/docker/compose:/opt/docker/compose:ro
+
+    networks:
+      - mcp
+
   mcp-gateway:
     image: docker/mcp-gateway:latest
     container_name: mcp-gateway
@@ -203,6 +336,7 @@ services:
       - --servers=model-council
       - --servers=playwright
       - --servers=local-image-reader
+      - --servers=klaket
       - --verify-signatures=false
       - --secrets=/root/.docker/mcp/.env
 
