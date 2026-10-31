@@ -16,9 +16,12 @@ flow (its redirect must be HTTPS, so the exchange happens in the browser).
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import http.server
 import json
 import os
+import secrets
 import sys
 import threading
 import urllib.parse
@@ -175,6 +178,67 @@ def _tiktok(args) -> None:
         print(f"stored, but the refresh failed: {exc}")
 
 
+def _tiktok_login(args) -> None:
+    """Full PKCE flow: print the authorize URL, take the redirect back, store
+    the refresh token. TikTok requires an HTTPS redirect registered on the app
+    — the browser does the redirect, we only read the pasted URL."""
+    client_key = args.client_key or os.environ.get("TIKTOK_CLIENT_KEY")
+    client_secret = args.client_secret or os.environ.get("TIKTOK_CLIENT_SECRET")
+    redirect_uri = args.redirect_uri or os.environ.get("TIKTOK_REDIRECT_URI")
+    if not (client_key and client_secret and redirect_uri):
+        sys.exit("need --client-key, --client-secret and --redirect-uri (the HTTPS URL registered on the app)")
+
+    verifier = secrets.token_urlsafe(64)[:64]
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    state = secrets.token_hex(8)
+    url = "https://www.tiktok.com/v2/auth/authorize/?" + urllib.parse.urlencode({
+        "client_key": client_key,
+        "scope": "user.info.basic,video.publish",
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "state": state,
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+    })
+    print("\nOpen this URL in a browser, sign in with the TikTok account to post from,\n"
+          "approve, then paste the FULL url you were redirected to (even if the page fails to load):\n\n"
+          + url + "\n")
+
+    pasted = input("redirect url: ").strip()
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(pasted).query)
+    if "error" in query:
+        sys.exit(f"authorization denied: {query['error']}")
+    code = (query.get("code") or [""])[0]
+    if not code:
+        sys.exit("no ?code= in the pasted URL")
+
+    resp = requests.post(tiktok_mod.TOKEN_URL, data={
+        "client_key": client_key,
+        "client_secret": client_secret,
+        "code": code,
+        "grant_type": "authorization_code",
+        "redirect_uri": redirect_uri,
+        "code_verifier": verifier,
+    }, timeout=30)
+    if resp.status_code != 200:
+        sys.exit(f"token exchange failed ({resp.status_code}): {resp.text[:300]}")
+    payload = resp.json()
+    if payload.get("error"):
+        sys.exit(f"token exchange error: {payload['error']} {payload.get('error_description', '')}")
+
+    store.save_account(
+        "tiktok",
+        client_key=client_key,
+        client_secret=client_secret,
+        refresh_token=payload["refresh_token"],
+        audited=bool(args.audited),
+        privacy_level=args.privacy or "SELF_ONLY",
+        open_id=payload.get("open_id", ""),
+    )
+    print("TikTok OK — refresh token stored. Scopes:", payload.get("scope", "?"))
+    print("Reminder: public posts need the Content Posting audit; until then everything is SELF_ONLY.")
+
+
 def _show(_args) -> None:
     data = store.accounts()
     print(json.dumps({
@@ -208,6 +272,14 @@ def main() -> None:
     tt.add_argument("--privacy", default="SELF_ONLY")
     tt.add_argument("--username")
     tt.set_defaults(func=_tiktok)
+
+    ttl = sub.add_parser("tiktok-login", help="PKCE login: prints the URL and stores the refresh token")
+    ttl.add_argument("--client-key")
+    ttl.add_argument("--client-secret")
+    ttl.add_argument("--redirect-uri")
+    ttl.add_argument("--audited", action="store_true")
+    ttl.add_argument("--privacy", default="SELF_ONLY")
+    ttl.set_defaults(func=_tiktok_login)
 
     show = sub.add_parser("show", help="print what is configured")
     show.set_defaults(func=_show)

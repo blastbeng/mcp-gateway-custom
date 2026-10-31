@@ -294,10 +294,11 @@ docker run --rm -it --network host \
 docker run --rm -v /opt/docker/compose/mcp/socialpost-data:/data socialpost-mcp:latest \
   python -m socialpost.auth meta --user-token EAAG... --app-id ... --app-secret ...
 
-# TikTok: store the refresh token from your app's OAuth flow
-docker run --rm -v /opt/docker/compose/mcp/socialpost-data:/data socialpost-mcp:latest \
-  python -m socialpost.auth tiktok --refresh-token ... --client-key ... --client-secret ... \
-  [--audited] [--privacy SELF_ONLY]
+# TikTok: PKCE login — prints the authorize URL, you paste back the redirect URL
+docker run --rm -it -v /opt/docker/compose/mcp/socialpost-data:/data socialpost-mcp:latest \
+  python -m socialpost.auth tiktok-login --client-key ... --client-secret ... \
+  --redirect-uri https://your-domain/tiktok/callback [--audited] [--privacy SELF_ONLY]
+# (or, if you already have a refresh token: `... auth tiktok --refresh-token ...`)
 ```
 
 Platform rules that the adapter cannot bypass (and reports as warnings):
