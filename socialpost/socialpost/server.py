@@ -146,9 +146,9 @@ def doctor() -> dict:
 
     try:
         probe_path = os.environ.get("SOCIALPOST_SELFTEST_FILE", "")
-        report["ffprobe_ok"] = bool(probe(probe_path)) if probe_path else "set SOCIALPOST_SELFTEST_FILE to test"
+        report["media_probe_ok"] = bool(probe(probe_path)) if probe_path else "set SOCIALPOST_SELFTEST_FILE to test"
     except MediaError as exc:
-        report["ffprobe_ok"] = f"error: {exc}"
+        report["media_probe_ok"] = f"error: {exc}"
 
     report["data_dir_writable"] = os.access(store.DATA_DIR, os.W_OK)
     report["notes"] = [

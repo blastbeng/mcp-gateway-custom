@@ -1,10 +1,15 @@
-"""ffprobe wrapper: the few facts every platform needs before an upload."""
+"""Media probe via PyAV — replaces a system ffmpeg install.
+
+PyAV ships its own FFmpeg libraries in the wheel (~30 MB), so the image stays
+around 200 MB instead of ~850 MB with Debian's ffmpeg package. We only need
+duration, resolution and container: enough for every platform's limits.
+"""
 
 from __future__ import annotations
 
-import json
 import pathlib
-import subprocess
+
+import av
 
 
 class MediaError(Exception):
@@ -17,34 +22,34 @@ def probe(path: str) -> dict:
         raise MediaError(f"file not found: {path}")
 
     try:
-        out = subprocess.run(
-            ["ffprobe", "-v", "error", "-print_format", "json",
-             "-show_format", "-show_streams", str(p)],
-            capture_output=True, text=True, timeout=60, check=False,
-        )
-    except FileNotFoundError as exc:  # pragma: no cover - image always has it
-        raise MediaError("ffprobe not installed") from exc
+        with av.open(str(p), mode="r") as container:
+            stream = next((s for s in container.streams if s.type == "video"), None)
+            if stream is None:
+                raise MediaError("no video stream in file")
 
-    if out.returncode != 0:
-        raise MediaError(f"ffprobe failed: {out.stderr.strip()[:300]}")
+            duration = float(container.duration / 1_000_000) if container.duration else 0.0
+            if duration <= 0 and stream.duration and stream.time_base:
+                duration = float(stream.duration * stream.time_base)
 
-    data = json.loads(out.stdout)
-    video = next((s for s in data.get("streams", []) if s.get("codec_type") == "video"), None)
-    if video is None:
-        raise MediaError("no video stream in file")
+            ctx = stream.codec_context
+            width = int(ctx.width or 0)
+            height = int(ctx.height or 0)
+            container_name = container.format.name or ""
+            fps = stream.average_rate
+    except MediaError:
+        raise
+    except Exception as exc:  # av.FFmpegError and friends
+        raise MediaError(f"cannot read media: {exc}") from exc
 
-    fmt = data.get("format", {})
-    width = int(video.get("width") or 0)
-    height = int(video.get("height") or 0)
     return {
         "path": str(p),
         "size": p.stat().st_size,
-        "duration": float(fmt.get("duration") or 0),
+        "duration": duration,
         "width": width,
         "height": height,
         "portrait": height > width,
         "aspect": round(width / height, 4) if height else 0,
-        "codec": video.get("codec_name"),
-        "container": fmt.get("format_name", ""),
-        "fps": video.get("avg_frame_rate"),
+        "codec": ctx.name,
+        "container": container_name,
+        "fps": str(fps) if fps else None,
     }

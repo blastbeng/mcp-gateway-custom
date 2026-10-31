@@ -72,7 +72,7 @@ Defined in [`catalog/custom.yaml`](catalog/custom.yaml) as a custom catalog (`lo
 | [`local-image-reader/`](local-image-reader/) | `local-image-reader-mcp:latest` | Thin wrapper on `python:3.12-slim`: installs the `mcp-local-image-reader` PyPI package (pinned, `mcp<2`) |
 | [`playwright/`](playwright/) | `playwright-mcp:latest` | Thin wrapper on `mcp/playwright:latest`: clears the stale Chromium `SingletonLock` before exec |
 | [`klaket/`](klaket/) | `klaket-api:latest`, `klaket-worker:latest`, `klaket-mcp:latest` | Three images from the pinned upstream tag `v0.7.1` ([huseyinstif/klaket](https://github.com/huseyinstif/klaket)): Go API, Python worker, stdio MCP server |
-| [`socialpost/`](socialpost/) | `socialpost-mcp:latest` | Thin publisher: `mcp` + `requests` + ffprobe, no database, no scheduler, no browser automation |
+| [`socialpost/`](socialpost/) | `socialpost-mcp:latest` | Thin publisher: `mcp` + `requests` + PyAV (probe only), no database, no scheduler, no browser automation |
 
 All of them are built automatically by the `mcp-image-checker` sidecar when missing (or run manually, e.g. `docker build -t local-image-reader-mcp:latest ./local-image-reader` — Klaket: `docker build -f klaket/worker.Dockerfile -t klaket-worker:latest ./klaket`). The base images they need (`node:22-alpine`, `golang:1.23-alpine`, `python:3.12-slim`, `alpine:3.20`, `mcp/playwright:latest`) are on the sidecar's pull list and, like these images, are in `PROTECTED_IMAGES` of `/usr/local/bin/manage-docker` so the monthly cleanup never deletes an image a build depends on.
 
@@ -270,12 +270,12 @@ Scope: speaker labels are **anonymous** (`S1`, `S2`, …) and consistent within 
 
 ### Social Post
 
-`socialpost` publishes one short video to **YouTube Shorts, Instagram Reels, Facebook Reels and TikTok** through the official APIs. It is deliberately not a scheduler: one container (~150 MB), no database, no queue, no browser automation. Source is [`socialpost/`](socialpost/).
+`socialpost` publishes one short video to **YouTube Shorts, Instagram Reels, Facebook Reels and TikTok** through the official APIs. It is deliberately not a scheduler: one container (~290 MB: Alpine, no system ffmpeg, PyAV carries the probe), no database, no queue, no browser automation. Source is [`socialpost/`](socialpost/).
 
 | Tool | What it does |
 |---|---|
 | `post_short` | `video_path`, `caption`, `platforms[]`, `title`, `privacy`, `dry_run`. Each platform is attempted independently and reports its own status, id, url and warnings |
-| `doctor` | What is configured per platform, when the access token expires, whether TikTok is audited, ffprobe and data-dir health |
+| `doctor` | What is configured per platform, when the access token expires, whether TikTok is audited, media-probe and data-dir health |
 | `post_history` | Last published shorts from the local append-only log |
 
 Uploads are direct — Instagram/Facebook use resumable uploads, YouTube `videos.insert`, TikTok chunked `FILE_UPLOAD` — so **nothing on this host is exposed publicly**. Media is read read-only from `/opt/projects` and `/tmp`.

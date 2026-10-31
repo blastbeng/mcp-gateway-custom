@@ -2,19 +2,15 @@
 # Facebook Reels and TikTok.
 #
 # No database, no queue, no scheduler: four HTTP adapters over the official
-# APIs, one stdio MCP server. ffmpeg is only used for ffprobe (duration,
-# resolution, size) so the image stays small.
-FROM python:3.12-slim
+# APIs, one stdio MCP server. No system ffmpeg either: PyAV's wheel bundles
+# the FFmpeg libraries we need to read duration/resolution (Debian's ffmpeg
+# package alone would add ~600 MB). Alpine rather than slim: every dependency
+# ships a musllinux aarch64 wheel, and the image is ~290 MB instead of ~420.
+FROM python:3.12-alpine
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     SOCIALPOST_DATA_DIR=/data
-
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-       ffmpeg \
-       ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 

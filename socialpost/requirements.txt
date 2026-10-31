@@ -2,3 +2,6 @@
 # Everything else (OAuth, resumable uploads, chunking) is stdlib + HTTP.
 mcp>=1.9,<2
 requests>=2.32,<3
+# PyAV bundles FFmpeg (probe only) so the image does not need the ~600 MB
+# Debian ffmpeg package. Pinned for reproducible aarch64 wheels.
+av==16.0.1
