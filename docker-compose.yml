@@ -14,6 +14,7 @@ services:
       - ./playwright:/opt/playwright:ro
       - ./torproxy:/opt/torproxy:ro
       - ./klaket:/opt/klaket:ro
+      - ./socialpost:/opt/socialpost:ro
     environment:
       CHECK_INTERVAL: "3600"
     command:
@@ -137,6 +138,21 @@ services:
                 || echo "ERROR building $$img:latest"
             fi
           done
+
+          echo "--- Social Post MCP (YouTube/IG/FB/TikTok) ---"
+
+          if docker image inspect socialpost-mcp:latest >/dev/null 2>&1; then
+            echo "OK: socialpost-mcp:latest"
+          else
+            echo "MISSING: socialpost-mcp:latest"
+            echo "Building socialpost-mcp:latest..."
+
+            docker build \
+              --pull \
+              -t socialpost-mcp:latest \
+              /opt/socialpost \
+              || echo "ERROR building socialpost-mcp:latest"
+          fi
 
           echo "--- torproxy (local build, Tor >= 0.4.8) ---"
 
@@ -337,6 +353,7 @@ services:
       - --servers=playwright
       - --servers=local-image-reader
       - --servers=klaket
+      - --servers=socialpost
       - --verify-signatures=false
       - --secrets=/root/.docker/mcp/.env
 
@@ -349,12 +366,15 @@ services:
 
     environment:
       MCP_GATEWAY_AUTH_TOKEN: ${MCP_GATEWAY_AUTH_TOKEN}
-      MCP_GATEWAY_DOCKER_BIND_ALLOWED_PATHS: "/opt/docker/compose/mcp/model-council-data:/opt/projects:/opt/docker/compose:/tmp"
+      # socialpost-data holds app credentials and rotating OAuth tokens
+      # (accounts.json, chmod 600): the server writes them at runtime, so it
+      # needs both the read-only allowlist and the writable one.
+      MCP_GATEWAY_DOCKER_BIND_ALLOWED_PATHS: "/opt/docker/compose/mcp/model-council-data:/opt/docker/compose/mcp/socialpost-data:/opt/projects:/opt/docker/compose:/tmp"
       # playwright's browser profile lives on /opt (never in the container layer,
       # i.e. never in /var/lib/docker on the small root fs); rw needs this list.
       # /tmp is here for playwright's output dir (screenshots/downloads land in
       # the shared host /tmp, rw); /tmp is already in the RO allowlist above.
-      MCP_GATEWAY_DOCKER_BIND_ALLOW_WRITABLE_PATHS: "/opt/docker/compose/mcp/chroma-data:/opt/docker/compose/mcp/chroma-cache:/opt/docker/compose/mcp/onionclaw-data:/opt/blast/cache/ms-playwright-mcp:/opt/blast/cache/ms-playwright:/tmp"
+      MCP_GATEWAY_DOCKER_BIND_ALLOW_WRITABLE_PATHS: "/opt/docker/compose/mcp/chroma-data:/opt/docker/compose/mcp/chroma-cache:/opt/docker/compose/mcp/onionclaw-data:/opt/docker/compose/mcp/socialpost-data:/opt/blast/cache/ms-playwright-mcp:/opt/blast/cache/ms-playwright:/tmp"
 
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock

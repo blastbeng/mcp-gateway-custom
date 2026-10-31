@@ -17,6 +17,8 @@ onionclaw-data/
 # Klaket job artifacts + downloaded models (whisper, sherpa-onnx, OCR)
 klaket-data/
 klaket-models/
+# Social Post credentials, rotating OAuth tokens and post history (chmod 600)
+socialpost-data/
 *.db
 *.sqlite3
 

@@ -1,0 +1,4 @@
+# Tiny, pinned surface: MCP SDK 1.x (2.x changed the decorators) + requests.
+# Everything else (OAuth, resumable uploads, chunking) is stdlib + HTTP.
+mcp>=1.9,<2
+requests>=2.32,<3

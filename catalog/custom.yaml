@@ -271,3 +271,38 @@ registry:
         value: "http://klaket-api:8484"
 
     longLived: true
+
+  socialpost:
+    title: Social Post
+    type: server
+    image: socialpost-mcp:latest
+    description: >
+      Thin publishing MCP for short-form video, through the official APIs —
+      no database, no scheduler, no browser automation. post_short uploads one
+      local file to any subset of YouTube Shorts, Instagram Reels, Facebook
+      Reels and TikTok, independently per platform; doctor reports what is
+      configured and when tokens expire; post_history lists what was
+      published.
+
+      Credentials and rotating OAuth tokens live in
+      /opt/docker/compose/mcp/socialpost-data/accounts.json (chmod 600),
+      written once by `python -m socialpost.auth youtube|meta|tiktok`.
+      Media is read read-only from /opt/projects and /tmp. Uploads are direct:
+      Instagram and Facebook use resumable uploads, so nothing on this host is
+      exposed publicly.
+
+      Platform rules still apply: TikTok publishes SELF_ONLY (private) until
+      the app passes the Content Posting audit; YouTube quota is ~6 uploads
+      per day and an OAuth app in 'Testing' expires refresh tokens after 7
+      days; Instagram needs a Business/Creator account linked to a Page.
+
+    env:
+      - name: SOCIALPOST_DATA_DIR
+        value: "/data"
+
+    volumes:
+      - "/opt/docker/compose/mcp/socialpost-data:/data:rw"
+      - "/opt/projects:/opt/projects:ro"
+      - "/tmp:/tmp:ro"
+
+    longLived: true
