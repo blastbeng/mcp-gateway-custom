@@ -363,12 +363,18 @@ def probe(base: str, key: str, model: str) -> tuple[str, str]:
     upstreams that choke on the parameter but would otherwise answer.
     "ok" means a well-formed completion body actually came back — an
     HTTP 200 carrying garbage is downgraded to unknown and retried next
-    cycle, so a model is added only once it demonstrably answers."""
+    cycle, so a model is added only once it demonstrably answers.
+    A transport failure (status 0: timeout, connection refused) is final:
+    the alternate body cannot revive a hung upstream, and retrying anyway
+    doubles the cost of every dead gpt4free id — with a 60s timeout that
+    is minutes per only-probe, i.e. most of a cycle."""
     detail = ""
     for body in ({"model": model, "messages": [{"role": "user", "content": "ping"}],
                   "max_tokens": 1},
                  {"model": model, "messages": [{"role": "user", "content": "ping"}]}):
         status, detail = _post_chat(base, key, model, body)
+        if status == 0:
+            return "unknown", detail[:200]
         if status == 200:
             if _valid_completion(detail):
                 return "ok", ""

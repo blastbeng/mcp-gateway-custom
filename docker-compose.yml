@@ -468,13 +468,16 @@ services:
       CANDIDATE_STRIKES: "2"
       CANDIDATE_RETRY_HOURS: "24"
       PROBE_ENABLED: "true"
-      PROBE_WORKERS: "12"
-      # gpt4free free providers answer anywhere between 2s and 90s (the
-      # code default of 25s seats only the fast half and makes the slower
-      # seats flicker: probed unknown, struck out, readmitted when fast).
-      # 60s covers most of the catalogue; probes are concurrent, so the
-      # hourly cycle still finishes in minutes.
-      PROBE_TIMEOUT: "60"
+      # gpt4free probes are NOT free for this host: each one drives g4f's
+      # AutoFree provider chain, and the browser-based providers hammer the
+      # shared gpt4free-chromium container. 12 concurrent probes at 60s
+      # pushed Chromium to 1 GiB (177% CPU) and the OOM killer took this
+      # container, the session proxy and the image checker down with it
+      # (2026-11-02 15:39). Keep the fleet small and the per-probe budget
+      # tight; a dead g4f id now costs one timeout instead of two (see
+      # probe() in sync.py: no second body after a transport failure).
+      PROBE_WORKERS: "4"
+      PROBE_TIMEOUT: "30"
       RESTART_GATEWAY: "false"
       GATEWAY_CONTAINER: "mcp-gateway"
     security_opt:
