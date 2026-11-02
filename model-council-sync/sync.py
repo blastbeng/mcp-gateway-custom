@@ -143,29 +143,23 @@ DOCKER_SOCK = os.environ.get("DOCKER_SOCK", "/var/run/docker.sock")
 #            AnyProvider router (Model("auto", base_provider=AnyProvider)).
 DEFAULT_RULES = {
     "rules": [
-        # every gpt4free model litellm exposes — the probe decides which
-        # of them actually answer. The g4f router "auto" is pinned: it is
-        # the AnyProvider auto router and must stay seated regardless of
-        # how a single probe goes.
-        {"id": "gpt4free", "pattern": r"^(?:gpt4free|g4f)/",
+        # The council holds exactly two seats: gpt4free's AnyProvider auto
+        # router (Model("auto", base_provider=AnyProvider)) and LiteLLM's
+        # free OpenRouter alias. Everything else a provider exposes is
+        # unclaimed and therefore dropped from the roster.
+        #
+        # Both are pinned: membership follows LiteLLM's listing alone — no
+        # probe, no strike-out. Besides being the only two seats (a flaky
+        # 1-token probe must not empty the council), it keeps the sync from
+        # exercising the whole gpt4free provider chain every hour, which on
+        # this host drives gpt4free-chromium into OOM and takes the stack
+        # down with it.
+        {"id": "gpt4free", "pattern": r"^(?:gpt4free|g4f)/auto$",
          "max_params_b": None, "free": "always",
          "pin": [r"(?:^|/)auto$"]},
-        {"id": "groq", "pattern": r"^groq/", "max_params_b": 32, "free": "probe"},
-        {"id": "ollama-cloud", "pattern": r"^ollama-cloud/", "max_params_b": 32, "free": "probe"},
-        {"id": "gemini", "pattern": r"^gemini/",
-         "max_params_b": 32, "free": "probe",
-         "allow": r"^gemini(-[\d.]+)?-flash(-lite)?$"
-                  r"|^gemini-flash(-lite)?-latest$"
-                  r"|^gemma-\d+-\d+b"},
-        # openrouter: only the free models — the ":free" suffix is the
-        # cost signal (the probe confirms it), and litellm's plain
-        # "openrouter/free" alias counts as free by its name. Seats are
-        # re-probed like every rule's: a free seat that starts charging
-        # must leave the roster. The hourly 1-token probe costs a sliver
-        # of the daily free quota — the price of never seating a paid model.
-        {"id": "openrouter", "pattern": r"^openrouter/",
-         "max_params_b": None, "free": "probe",
-         "allow": r"(?::free$|^free$)"},
+        {"id": "openrouter", "pattern": r"^openrouter/free$",
+         "max_params_b": None, "free": "always",
+         "pin": [r"(?:^|/)free$"]},
     ]
 }
 

@@ -2,36 +2,17 @@
   "rules": [
     {
       "id": "gpt4free",
-      "pattern": "^(?:gpt4free|g4f)/",
+      "pattern": "^(?:gpt4free|g4f)/auto$",
       "max_params_b": null,
       "free": "always",
       "pin": ["(?:^|/)auto$"]
     },
     {
-      "id": "groq",
-      "pattern": "^groq/",
-      "max_params_b": 32,
-      "free": "probe"
-    },
-    {
-      "id": "ollama-cloud",
-      "pattern": "^ollama-cloud/",
-      "max_params_b": 32,
-      "free": "probe"
-    },
-    {
-      "id": "gemini",
-      "pattern": "^gemini/",
-      "max_params_b": 32,
-      "free": "probe",
-      "allow": "^gemini(-[\\d.]+)?-flash(-lite)?$|^gemini-flash(-lite)?-latest$|^gemma-\\d+-\\d+b"
-    },
-    {
       "id": "openrouter",
-      "pattern": "^openrouter/",
+      "pattern": "^openrouter/free$",
       "max_params_b": null,
-      "free": "probe",
-      "allow": "(?::free$|^free$)"
+      "free": "always",
+      "pin": ["(?:^|/)free$"]
     }
   ]
 }
