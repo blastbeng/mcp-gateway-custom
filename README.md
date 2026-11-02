@@ -41,7 +41,7 @@ A self-hosted, Docker Compose-based stack that runs the [Docker MCP Gateway](htt
 | `mcp-image-checker` | `docker:cli` | Cron-like sidecar (hourly) that pulls required images and rebuilds the locally built images (MCP servers + `torproxy` + `klaket-*`) if missing |
 | `klaket-api` | `klaket-api:latest` (local build, `klaket/`) | Klaket job API (Go): accepts ingest requests, queues them on Redis, serves status/result/export |
 | `klaket-worker` | `klaket-worker:latest` (local build, `klaket/`) | Offline media pipeline: ffmpeg + faster-whisper + sherpa-onnx diarization + OpenCV scenes + OCR. No torch |
-| `model-council-sync` | `python:3.12-alpine` | Keeps the council roster in step with LiteLLM (all `inference4free` models, free-only OpenRouter models incl. the `openrouter/free` alias, small+free Groq/Ollama/Gemini): every seat is probe-verified before joining and re-probed while seated; drops vanished, paid, or repeatedly-failing seats; no static members — anything no rule claims is dropped; restarts the gateway only when the roster actually changed |
+| `model-council-sync` | `python:3.12-alpine` | Keeps the council roster in step with LiteLLM (all `gpt4free` models — its `auto` AnyProvider router pinned — free-only OpenRouter models incl. the `openrouter/free` alias, small+free Groq/Ollama/Gemini): every non-pinned seat is probe-verified before joining and re-probed while seated; drops vanished, paid, or repeatedly-failing seats; no static members — anything no rule claims is dropped; restarts the gateway only when the roster actually changed |
 
 ### MCP servers registered in the gateway
 
@@ -60,7 +60,6 @@ Defined in [`catalog/custom.yaml`](catalog/custom.yaml) as a custom catalog (`lo
 | `playwright` | Local | Headless Chromium browser automation (Microsoft Playwright MCP): navigate, snapshot, click, type, screenshot, evaluate, inspect network — runs as a gateway container instead of a host `npx` process |
 | `local-image-reader` | Local | Reads a local image file and returns it as base64 `ImageContent` for a vision-capable client model (single tool: `read_image`) |
 | `klaket` | Local | **Klaket** — offline audio/video analysis: transcript with word timestamps and speaker labels, language detection, scenes/keyframes, OCR, SRT/VTT, in-video search. Tools: `klaket_ingest`, `klaket_job_status`, `klaket_get_result`, `klaket_find_moment` |
-| `socialpost` | Local | **Social Post** — thin publisher for short-form video through the official APIs: YouTube Shorts, Instagram Reels, Facebook Reels, TikTok. Tools: `post_short` (per-platform result, `dry_run`), `doctor` (config/token state), `post_history` |
 
 ### Locally built MCP images
 
@@ -72,7 +71,6 @@ Defined in [`catalog/custom.yaml`](catalog/custom.yaml) as a custom catalog (`lo
 | [`local-image-reader/`](local-image-reader/) | `local-image-reader-mcp:latest` | Thin wrapper on `python:3.12-slim`: installs the `mcp-local-image-reader` PyPI package (pinned, `mcp<2`) |
 | [`playwright/`](playwright/) | `playwright-mcp:latest` | Thin wrapper on `mcp/playwright:latest`: clears the stale Chromium `SingletonLock` before exec |
 | [`klaket/`](klaket/) | `klaket-api:latest`, `klaket-worker:latest`, `klaket-mcp:latest` | Three images from the pinned upstream tag `v0.7.1` ([huseyinstif/klaket](https://github.com/huseyinstif/klaket)): Go API, Python worker, stdio MCP server |
-| [`socialpost/`](socialpost/) | `socialpost-mcp:latest` | Thin publisher: `mcp` + `requests` + PyAV (probe only), no database, no scheduler, no browser automation |
 
 All of them are built automatically by the `mcp-image-checker` sidecar when missing (or run manually, e.g. `docker build -t local-image-reader-mcp:latest ./local-image-reader` — Klaket: `docker build -f klaket/worker.Dockerfile -t klaket-worker:latest ./klaket`). The base images they need (`node:22-alpine`, `golang:1.23-alpine`, `python:3.12-slim`, `alpine:3.20`, `mcp/playwright:latest`) are on the sidecar's pull list and, like these images, are in `PROTECTED_IMAGES` of `/usr/local/bin/manage-docker` so the monthly cleanup never deletes an image a build depends on.
 
@@ -127,7 +125,7 @@ The config defines the LiteLLM provider and the council **members** (models that
 
 ### Model Council auto-sync (`model-council-sync`)
 
-The council server reads its roster **once at startup**, while the providers behind it change over time: new `inference4free` routers appear (and vanish), Groq / Ollama Cloud / Gemini expose a shifting mix of paid and free models, and OpenRouter rotates its `:free` catalogue. The `model-council-sync` sidecar reconciles the roster every `SYNC_INTERVAL` seconds (default 1h):
+The council server reads its roster **once at startup**, while the providers behind it change over time: the `gpt4free` catalogue appears, vanishes and shifts (the `auto` router is pinned so it keeps its seat even while a probe fails), Groq / Ollama Cloud / Gemini expose a shifting mix of paid and free models, and OpenRouter rotates its `:free` catalogue. The `model-council-sync` sidecar reconciles the roster every `SYNC_INTERVAL` seconds (default 1h):
 
 1. lists the models LiteLLM currently exposes (`GET /v1/models`, credentials taken from the config's own `providers.litellm` block);
 2. decides which models belong on the council with a **rules engine** (`model-council-data/sync-rules.json`, auto-created with defaults on first run):
@@ -139,7 +137,7 @@ The council server reads its roster **once at startup**, while the providers beh
 4. **drops** any member no rule claims — there are no static members: every seat came from LiteLLM through a rule and a passing probe (the former hand-written `openrouter/free` / `small-model` included), and the sync fills the initially empty `members` list by itself;
 5. rewrites `config.json` atomically (previous copy kept as `config.json.bak`, strikes tracked in `.sync-state.json`) **only when something actually changed**, then restarts `mcp-gateway` so the council picks the new roster up — client sessions are healed transparently by `mcp-session-proxy`.
 
-Rule knobs (per provider: `inference4free`, `groq`, `ollama-cloud`, `gemini`, `openrouter`): `pattern` (there is no `exclude` knob — an unclaimed member is a static leftover and is dropped), `max_params_b`, `small_keywords`, `allow` (regex *searched* against the model's last segment — the Gemini default admits only the text flash/flash-lite family and small Gemma models, skipping image/audio/TTS/preview variants; the OpenRouter rule admits only free models: ids ending in `:free`, the cost signal OpenRouter puts in the model id — LiteLLM does not carry the price through `/model/info` — plus litellm's `openrouter/free` alias), `free` (`always` = free by construction, probe = aliveness only; `probe` = the probe decides free vs paid), `probe_existing` (re-check owned seats every cycle; default on for every rule — a seat that turned paid, or that keeps failing its probe, must leave the roster). Probes run concurrently (`PROBE_WORKERS`, default 12). Global env knobs: `SYNC_INTERVAL`, `REMOVE_AFTER_MISSES`, `CANDIDATE_STRIKES`, `CANDIDATE_RETRY_HOURS`, `PROBE_ENABLED`, `PROBE_TIMEOUT`, `PROBE_WORKERS`, `RESTART_GATEWAY`, `GATEWAY_CONTAINER`, `LITELLM_BASE_URL`/`LITELLM_API_KEY`.
+Rule knobs (per provider: `gpt4free`, `groq`, `ollama-cloud`, `gemini`, `openrouter`): `pattern` (there is no `exclude` knob — an unclaimed member is a static leftover and is dropped; the gpt4free rule accepts both the `gpt4free/` and `g4f/` id prefixes), `max_params_b`, `small_keywords`, `allow` (regex *searched* against the model's last segment — the Gemini default admits only the text flash/flash-lite family and small Gemma models, skipping image/audio/TTS/preview variants; the OpenRouter rule admits only free models: ids ending in `:free`, the cost signal OpenRouter puts in the model id — LiteLLM does not carry the price through `/model/info` — plus litellm's `openrouter/free` alias), `free` (`always` = free by construction, probe = aliveness only; `probe` = the probe decides free vs paid), `pin` (regexes on the full model id: a pinned model — gpt4free's `auto` AnyProvider router — is seated as soon as LiteLLM lists it, is never probed and no probe verdict can strike it out; it still leaves when LiteLLM stops listing it), `probe_existing` (re-check owned seats every cycle; default on for every rule — a seat that turned paid, or that keeps failing its probe, must leave the roster; pinned seats are never re-probed). Probes run concurrently (`PROBE_WORKERS`, default 12). Global env knobs: `SYNC_INTERVAL`, `REMOVE_AFTER_MISSES`, `CANDIDATE_STRIKES`, `CANDIDATE_RETRY_HOURS`, `PROBE_ENABLED`, `PROBE_TIMEOUT`, `PROBE_WORKERS`, `RESTART_GATEWAY`, `GATEWAY_CONTAINER`, `LITELLM_BASE_URL`/`LITELLM_API_KEY`.
 
 ### SearXNG
 
@@ -268,50 +266,6 @@ Settings live in `docker-compose.yml` under `klaket-worker`: `WHISPER_MODEL` = `
 
 Scope: speaker labels are **anonymous** (`S1`, `S2`, …) and consistent within one job. This is transcription + diarization — not voiceprint/identification and not emotion analysis. Argos translation is deliberately not installed (it would pull torch, spacy and stanza for a feature the MCP server does not expose).
 
-### Social Post
-
-`socialpost` publishes one short video to **YouTube Shorts, Instagram Reels, Facebook Reels and TikTok** through the official APIs. It is deliberately not a scheduler: one container (~290 MB: Alpine, no system ffmpeg, PyAV carries the probe), no database, no queue, no browser automation. Source is [`socialpost/`](socialpost/).
-
-| Tool | What it does |
-|---|---|
-| `post_short` | `video_path`, `caption`, `platforms[]`, `title`, `privacy`, `dry_run`. Each platform is attempted independently and reports its own status, id, url and warnings |
-| `doctor` | What is configured per platform, when the access token expires, whether TikTok is audited, media-probe and data-dir health |
-| `post_history` | Last published shorts from the local append-only log |
-
-Uploads are direct — Instagram/Facebook use resumable uploads, YouTube `videos.insert`, TikTok chunked `FILE_UPLOAD` — so **nothing on this host is exposed publicly**. Media is read read-only from `/opt/projects` and `/tmp`.
-
-Credentials are not in `.env`: they live in `/opt/docker/compose/mcp/socialpost-data/accounts.json` (mode 600, git-ignored) because rotating tokens must be rewritten at runtime, and `.env` is mounted read-only into the gateway. Bootstrap them once with the helper (it needs network and the same data dir):
-
-```bash
-# YouTube: loopback OAuth (Google Cloud > Credentials > OAuth client, type Desktop)
-docker run --rm -it --network host \
-  -v /opt/docker/compose/mcp/socialpost-data:/data socialpost-mcp:latest \
-  python -m socialpost.auth youtube --client-id ... --client-secret ...
-
-# Meta: paste a long-lived user token (Graph API Explorer, permissions
-# instagram_content_publish + pages_manage_posts + pages_show_list); the helper
-# derives the Page token and the IG business account id
-docker run --rm -v /opt/docker/compose/mcp/socialpost-data:/data socialpost-mcp:latest \
-  python -m socialpost.auth meta --user-token EAAG... --app-id ... --app-secret ...
-
-# TikTok: PKCE login — prints the authorize URL, you paste back the redirect URL
-docker run --rm -it -v /opt/docker/compose/mcp/socialpost-data:/data socialpost-mcp:latest \
-  python -m socialpost.auth tiktok-login --client-key ... --client-secret ... \
-  --redirect-uri https://your-domain/tiktok/callback [--audited] [--privacy SELF_ONLY]
-# (or, if you already have a refresh token: `... auth tiktok --refresh-token ...`)
-```
-
-Platform rules that the adapter cannot bypass (and reports as warnings):
-
-| Platform | Requirement | Behaviour here |
-|---|---|---|
-| YouTube | OAuth app published, quota 1600 units/upload (~6/day) | warns on non-vertical or >180 s (not a Short) |
-| Instagram | Business/Creator account linked to a Page | warns on non-vertical; Reels published via `media_publish` |
-| Facebook | Page + `pages_manage_posts` | warns if >90 s |
-| TikTok | app **audited** for public posts | unaudited → `SELF_ONLY` (private) with an explicit warning; refresh token rotation persisted automatically |
-
-`accounts.json` fields: `youtube{client_id,client_secret,refresh_token}`, `meta{app_id,app_secret,page_id,ig_user_id,access_token}`, `tiktok{client_key,client_secret,refresh_token,audited,privacy_level}`.
-
 ## Repository layout
 
 ```
@@ -351,11 +305,6 @@ Platform rules that the adapter cannot bypass (and reports as warnings):
 │   └── mcp.Dockerfile       # Builds klaket-mcp:latest (stdio client of the API)
 ├── klaket-data/             # Klaket job artifacts (git-ignored)
 ├── klaket-models/           # Klaket model cache (git-ignored)
-├── socialpost/
-│   ├── Dockerfile           # Builds socialpost-mcp:latest
-│   ├── requirements.txt     # mcp 1.x + requests, nothing else
-│   └── socialpost/          # server, platform adapters, auth helper, store
-├── socialpost-data/         # credentials, OAuth tokens, post log (git-ignored)
 ├── docker-compose.yml       # Full stack definition
 └── .env                     # Secrets (git-ignored)
 ```

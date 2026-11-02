@@ -43,7 +43,7 @@ Every cycle this script:
        strikes that cycle. A struck-out model returns as a candidate the
        cycle it answers ok again.
 
-       a rule with free:"always" (inference4free) probes candidates for
+       a rule with free:"always" (gpt4free) probes candidates for
        aliveness only; a rule with free:"probe" probes for free vs paid.
        Every rule also re-probes its existing seats every cycle
        (probe_existing, on by default — a rule may opt out to spare the
@@ -53,7 +53,11 @@ Every cycle this script:
        seat whose probe keeps coming back unknown is struck out after
        REMOVE_AFTER_MISSES consecutive failed probes.
        Admission itself is the same for every rule: only an "ok" probe
-       ever adds a candidate;
+       ever adds a candidate, with one exception: a rule's "pin" list
+       (gpt4free's auto router) names ids that are seated as soon as
+       litellm lists them and are never removed by a probe — the catalog
+       alone decides their membership, so a free-by-construction router
+       that is briefly flaky still holds its seat;
   3. strikes seats that vanish from litellm or probe as paid/gone, drops
      members no rule claims (there is no such thing as a static seat),
      and probe-fail-strikes seats whose own probe keeps coming back
@@ -131,12 +135,21 @@ DOCKER_SOCK = os.environ.get("DOCKER_SOCK", "/var/run/docker.sock")
 #            when a re-probe would burn the provider's daily free quota
 #            and a lingering broken seat is acceptable — candidates are
 #            probed once regardless
+# pin      : list of regexes, matched against the full model id. A pinned
+#            model is seated as soon as litellm lists it and is never
+#            probed, so no probe verdict can strike it out (a pinned seat
+#            still leaves when litellm stops listing it). For ids that
+#            must hold their seat even while flaky — gpt4free's "auto"
+#            AnyProvider router (Model("auto", base_provider=AnyProvider)).
 DEFAULT_RULES = {
     "rules": [
-        # every inference4free model litellm exposes — the probe decides
-        # which of them actually answer
-        {"id": "inference4free", "pattern": r"^inference4free/",
-         "max_params_b": None, "free": "always"},
+        # every gpt4free model litellm exposes — the probe decides which
+        # of them actually answer. The g4f router "auto" is pinned: it is
+        # the AnyProvider auto router and must stay seated regardless of
+        # how a single probe goes.
+        {"id": "gpt4free", "pattern": r"^(?:gpt4free|g4f)/",
+         "max_params_b": None, "free": "always",
+         "pin": [r"(?:^|/)auto$"]},
         {"id": "groq", "pattern": r"^groq/", "max_params_b": 32, "free": "probe"},
         {"id": "ollama-cloud", "pattern": r"^ollama-cloud/", "max_params_b": 32, "free": "probe"},
         {"id": "gemini", "pattern": r"^gemini/",
@@ -245,6 +258,9 @@ def load_rules() -> list[dict]:
             free = r.get("free", "probe")
             if free not in ("always", "probe"):
                 raise ValueError(f"free must be 'always' or 'probe', got {free!r}")
+            pins = r.get("pin") or []
+            if isinstance(pins, str):
+                pins = [pins]
             parsed.append({
                 "id": str(r.get("id", pattern.pattern)),
                 "pattern": pattern,
@@ -253,6 +269,7 @@ def load_rules() -> list[dict]:
                 "allow": re.compile(r["allow"]) if r.get("allow") else None,
                 "free": free,
                 "probe_existing": bool(r.get("probe_existing", True)),
+                "pin": tuple(re.compile(p) for p in pins),
             })
         except Exception as e:
             raise ValueError(f"bad rule {r.get('id', '?')}: {e} — cycle aborted") from e
@@ -399,6 +416,14 @@ def owner_rule(model_id: str, rules: list[dict]) -> dict | None:
     return None
 
 
+def is_pinned(model_id: str, rule: dict) -> bool:
+    """A pinned id joins without a probe and is never struck out by one:
+    litellm's listing alone decides whether it holds its seat. Meant for
+    ids that must be on the council even while their upstream is flaky
+    (gpt4free's "auto" router, free by construction)."""
+    return any(p.search(model_id) for p in rule["pin"])
+
+
 # --------------------------------------------------------------------------- #
 # docker
 # --------------------------------------------------------------------------- #
@@ -541,7 +566,8 @@ def sync_cycle() -> None:
         for rule in rules:
             if not rule["probe_existing"]:
                 continue
-            targets = [m for m, (r, _) in owned.items() if r["id"] == rule["id"]]
+            targets = [m for m, (r, _) in owned.items()
+                       if r["id"] == rule["id"] and not is_pinned(m, r)]
             verdicts = {m: v for m, (v, _) in probe_many(base, key, targets).items()}
             paid = [m for m, v in verdicts.items() if v == "paid"]
             if len(paid) >= 2 and len(paid) == len(verdicts):
@@ -552,7 +578,7 @@ def sync_cycle() -> None:
         # Phase 2 — a probe blackout is only excused when it is GATEWAY-WIDE
         # (every owned seat of every rule failed at once: litellm itself is
         # having a moment). A single family going dark while every other
-        # rule answers — e.g. all of inference4free unknown, groq/gemini/
+        # rule answers — e.g. all of gpt4free unknown, groq/gemini/
         # openrouter fine — is evidence that family's models are broken:
         # probe-fail strikes proceed and the dead seats leave the roster.
         total_seats = sum(len(v) for v in seat_verdicts.values())
@@ -569,6 +595,10 @@ def sync_cycle() -> None:
             dead = [] if gateway_wide else [m for m, v in verdicts.items()
                                             if v == "unknown"]
             for m, v in verdicts.items():
+                if is_pinned(m, rule):
+                    # Pinned seats are never in targets, but guard anyway:
+                    # no probe verdict may remove them — the catalog does.
+                    continue
                 if v in ("ok", "free"):
                     # A healthy probe clears a missing/paid/probe-fail strike
                     # — the seat recovered — but never an oversize one: no
@@ -608,6 +638,7 @@ def sync_cycle() -> None:
     # (free), then the allow filter, then the probe (concurrent, bounded).
     todo: list[str] = []
     cand_rule: dict[str, dict] = {}
+    added: list[str] = []
     for model in sorted(live):
         if model in owned:
             continue
@@ -617,6 +648,13 @@ def sync_cycle() -> None:
         if size_class(model, rule) != "small":
             continue
         if rule["allow"] and not rule["allow"].search(model.rsplit("/", 1)[-1]):
+            continue
+        if is_pinned(model, rule):
+            # Membership by catalog alone: no probe, no cooldown, so a
+            # flaky upstream can never keep a pinned seat off the council.
+            state["candidate_strikes"].pop(model, None)
+            owned[model] = (rule, {"id": model, "provider": "litellm", "model": model})
+            added.append(model)
             continue
         if not PROBE_ENABLED:
             log(f"candidate {model} skipped: probing disabled")
@@ -629,7 +667,6 @@ def sync_cycle() -> None:
             continue
         todo.append(model)
         cand_rule[model] = rule
-    added: list[str] = []
     probed = probe_many(base, key, todo)
     for model in todo:
         verdict, detail = probed[model]

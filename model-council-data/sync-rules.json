@@ -1,10 +1,11 @@
 {
   "rules": [
     {
-      "id": "inference4free",
-      "pattern": "^inference4free/",
+      "id": "gpt4free",
+      "pattern": "^(?:gpt4free|g4f)/",
       "max_params_b": null,
-      "free": "always"
+      "free": "always",
+      "pin": ["(?:^|/)auto$"]
     },
     {
       "id": "groq",
