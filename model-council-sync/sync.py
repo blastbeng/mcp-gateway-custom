@@ -534,6 +534,21 @@ def sync_cycle() -> None:
 
     struck_now: set[str] = set()
 
+    # A litellm restart can answer /v1/models with a shrunken catalogue for
+    # a while (observed 2026-11-02: 800 -> ~520 models while the litellm
+    # stack was bouncing; two such cycles wiped ~200 seats). That is a
+    # listing outage, not N dead models: no strikes, no probes, roster left
+    # untouched. Legitimate catalogue changes are gradual and fall well
+    # inside the threshold.
+    prev_live = state.get("live_count")
+    state["live_count"] = len(live)
+    if (isinstance(prev_live, int) and prev_live >= 20
+            and len(live) < prev_live * 0.75):
+        log(f"litellm listed {len(live)} models, down from {prev_live} — "
+            f"treating as a listing outage, roster untouched this cycle")
+        save_state(state)
+        return
+
     # Vanished models: every owned seat litellm no longer lists.
     for model in sorted(owned):
         if model not in live:
