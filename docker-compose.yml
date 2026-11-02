@@ -469,6 +469,12 @@ services:
       CANDIDATE_RETRY_HOURS: "24"
       PROBE_ENABLED: "true"
       PROBE_WORKERS: "12"
+      # gpt4free free providers answer anywhere between 2s and 90s (the
+      # code default of 25s seats only the fast half and makes the slower
+      # seats flicker: probed unknown, struck out, readmitted when fast).
+      # 60s covers most of the catalogue; probes are concurrent, so the
+      # hourly cycle still finishes in minutes.
+      PROBE_TIMEOUT: "60"
       RESTART_GATEWAY: "false"
       GATEWAY_CONTAINER: "mcp-gateway"
     security_opt:
