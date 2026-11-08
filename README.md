@@ -58,6 +58,7 @@ Defined in [`catalog/custom.yaml`](catalog/custom.yaml) as a custom catalog (`lo
 | `context7` | Remote | Up-to-date, version-specific library/framework documentation ([mcp.context7.com](https://mcp.context7.com)) |
 | `model-council` | Local | Multi-model "AI council" backed by LiteLLM: second opinions, code review, architecture advice, multi-model synthesis |
 | `playwright` | Local | Headless Chromium browser automation (Microsoft Playwright MCP): navigate, snapshot, click, type, screenshot, evaluate, inspect network — runs as a gateway container instead of a host `npx` process |
+| `chrome-devtools` | Local | Google Chrome DevTools MCP: live Chrome for Testing automation and debugging — navigate, snapshot, click/fill, screenshots, console/network inspection, script evaluation, performance traces and Lighthouse audits |
 | `local-image-reader` | Local | Reads a local image file and returns it as base64 `ImageContent` for a vision-capable client model (single tool: `read_image`) |
 | `klaket` | Local | **Klaket** — offline audio/video analysis: transcript with word timestamps and speaker labels, language detection, scenes/keyframes, OCR, SRT/VTT, in-video search. Tools: `klaket_ingest`, `klaket_job_status`, `klaket_get_result`, `klaket_find_moment` |
 
@@ -70,9 +71,10 @@ Defined in [`catalog/custom.yaml`](catalog/custom.yaml) as a custom catalog (`lo
 | [`telegram-notify/`](telegram-notify/) | `telegram-notify-mcp:latest` | Thin wrapper on `node:22-alpine`: installs the `telegram-notifier-mcp` npm package (pinned) |
 | [`local-image-reader/`](local-image-reader/) | `local-image-reader-mcp:latest` | Thin wrapper on `python:3.12-slim`: installs the `mcp-local-image-reader` PyPI package (pinned, `mcp<2`) |
 | [`playwright/`](playwright/) | `playwright-mcp:latest` | Thin wrapper on `mcp/playwright:latest`: clears the stale Chromium `SingletonLock` before exec |
+| [`chrome-devtools/`](chrome-devtools/) | `chrome-devtools-mcp:latest` | Node 22 image with Chrome for Testing + the `chrome-devtools-mcp` npm package (both resolved fresh at build time) |
 | [`klaket/`](klaket/) | `klaket-api:latest`, `klaket-worker:latest`, `klaket-mcp:latest` | Three images from the pinned upstream tag `v0.7.1` ([huseyinstif/klaket](https://github.com/huseyinstif/klaket)): Go API, Python worker, stdio MCP server |
 
-All of them are built automatically by the `mcp-image-checker` sidecar when missing (or run manually, e.g. `docker build -t local-image-reader-mcp:latest ./local-image-reader` — Klaket: `docker build -f klaket/worker.Dockerfile -t klaket-worker:latest ./klaket`). The base images they need (`node:22-alpine`, `golang:1.23-alpine`, `python:3.12-slim`, `alpine:3.20`, `mcp/playwright:latest`) are on the sidecar's pull list and, like these images, are in `PROTECTED_IMAGES` of `/usr/local/bin/manage-docker` so the monthly cleanup never deletes an image a build depends on.
+All of them are built automatically by the `mcp-image-checker` sidecar when missing (or run manually, e.g. `docker build -t local-image-reader-mcp:latest ./local-image-reader` — Klaket: `docker build -f klaket/worker.Dockerfile -t klaket-worker:latest ./klaket`). The base images they need (`node:22-alpine`, `node:22-bookworm-slim`, `golang:1.23-alpine`, `python:3.12-slim`, `alpine:3.20`, `mcp/playwright:latest`) are on the sidecar's pull list and, like these images, are in `PROTECTED_IMAGES` of `/usr/local/bin/manage-docker` so the monthly cleanup never deletes an image a build depends on.
 
 ## Configuration
 
@@ -216,6 +218,22 @@ volumes:
 
 The first two host directories are owned by uid 1000, which is the container's `node` user, so no chown is needed. The second one exists because the server's browser *registry* ignores `PLAYWRIGHT_BROWSERS_PATH`; without the mount Docker creates the missing parent `/home/node/.cache` as `root:root` and the unprivileged `node` user fails with `EACCES: permission denied, mkdir '/home/node/.cache/ms-playwright'`. The container is spawned by the gateway, so all three binds must also appear in `MCP_GATEWAY_DOCKER_BIND_ALLOWED_PATHS` (read-write ones in `MCP_GATEWAY_DOCKER_BIND_ALLOW_WRITABLE_PATHS`) in `docker-compose.yml`. Note that the profile **directory name follows the browser build** baked into the image (`mcp-chrome-for-testing-<hash>`), so profiles written by a different Playwright version sit in sibling directories rather than being reused.
 
+### Chrome DevTools
+
+`chrome-devtools` is Google's [Chrome DevTools MCP](https://github.com/ChromeDevTools/chrome-devtools-mcp) — a real Chrome driven over the DevTools protocol, not just page automation. 32 tools: `new_page` / `navigate_page` / `list_pages`, `take_snapshot` + `click` / `fill` / `type_text` / `press_key`, `take_screenshot`, `list_console_messages` / `get_console_message`, `list_network_requests` / `get_network_request`, `evaluate_script`, `performance_start_trace` / `performance_stop_trace` / `performance_analyze_insight`, `lighthouse_audit`, `take_heapsnapshot` and the rest. It complements `playwright`: Playwright is the general automation lane, Chrome DevTools is the debugging/performance lane (traces, console with source maps, network bodies, Lighthouse).
+
+Google publishes only the npm package — there is no upstream image and no hosted endpoint — so [`chrome-devtools/`](chrome-devtools/) builds a local image. Chrome for Testing is the upstream-supported browser; both its stable-channel version (from Google's `last-known-good-versions.json`) and the npm package (`chrome-devtools-mcp@latest`) are resolved at **build** time, so rebuilding the image is how the server is updated. `mcp-image-checker` only builds it when missing.
+
+**Non-root + sandbox probe.** Chrome refuses to run as root (crbug.com/638180), so the image runs as `node` (uid 1000). Even non-root, Chrome's sandbox needs either unprivileged user namespaces or its SUID helper; this host's Docker setup allows neither. The entrypoint therefore probes Chrome once at startup and appends `--chrome-arg=--no-sandbox` only when the probe reports a sandbox/namespace failure (it logs which mode it chose to stderr). The container — `no-new-privileges` at the gateway level and the gateway's own CPU/memory caps — remains the isolation boundary. `--chrome-arg=--disable-dev-shm-usage` is always passed because Docker's default `/dev/shm` is 64 MB.
+
+**Throwaway profile.** `--isolated` gives every browser run a temporary user-data dir. The default profile under `$HOME/.cache` would survive container restarts and Chrome's `ProcessSingleton` would then refuse to start — the same failure the Playwright wrapper had to work around — so no host profile mount exists and no lock cleanup is needed. Trade-off: cookies and logins do not outlive the container (they do survive across tool calls for as long as the long-lived child runs).
+
+**Privacy and noise.** Usage statistics, CrUX trace lookups and npm update checks are disabled (`--usageStatistics=false`, `--performanceCrux=false`, `CHROME_DEVTOOLS_MCP_NO_*` env vars), so the server makes no Google calls of its own.
+
+**Filesystem.** The catalog mounts `/tmp` read-write at the same path: that is both the server's OS temp dir and the only root its file tools may touch (clients that do not negotiate MCP roots are restricted to the temp dir). Screenshots and downloads written as `/tmp/...` are therefore on the host `/tmp`, where `telegram-notify` and `local-image-reader` can pick them up. `/tmp` is already in `MCP_GATEWAY_DOCKER_BIND_ALLOW_WRITABLE_PATHS`.
+
+The image is ~1 GB (Chrome for Testing + runtime libraries), built by `mcp-image-checker` when missing and kept by `PROTECTED_IMAGES` in `/usr/local/bin/manage-docker`, together with its `node:22-bookworm-slim` base.
+
 ### Local Image Reader
 
 `local-image-reader` is a single-tool local server — `read_image` — that returns a local image file as base64 `ImageContent` for a vision-capable client model (PNG/JPEG/GIF/WebP/BMP/SVG). It is the containerised form of the `mcp-local-image-reader` host MCP AiderDesk used to launch with `uvx`; see [`local-image-reader/`](local-image-reader/).
@@ -287,6 +305,9 @@ Scope: speaker labels are **anonymous** (`S1`, `S2`, …) and consistent within 
 ├── playwright/
 │   ├── Dockerfile           # Builds playwright-mcp:latest (wrapper on mcp/playwright)
 │   └── entrypoint.sh        # Clears the stale Chromium SingletonLock
+├── chrome-devtools/
+│   ├── Dockerfile           # Builds chrome-devtools-mcp:latest (Chrome for Testing + npm package)
+│   └── entrypoint.sh        # Headless defaults, sandbox probe, isolated profile
 ├── onionclaw-data/          # SICRY SQLite DB (git-ignored)
 ├── chroma-data/             # ChromaDB persistence (git-ignored)
 ├── chroma-cache/            # ChromaDB/HNSW cache (git-ignored)
@@ -327,9 +348,11 @@ cp model-council-data/config.example.json model-council-data/config.json
 # edit model-council-data/config.json with your LiteLLM URL + key
 
 docker compose build          # builds onionclaw-mcp, model-council-mcp, telegram-notify-mcp, local-image-reader-mcp, playwright-mcp and torproxy
-# klaket-api/worker/mcp have no `build:` stanza (one source tree, three targets):
-# the mcp-image-checker builds them on its first pass, or build them by hand:
+# klaket-api/worker/mcp have no `build:` stanza (one source tree, three targets), and
+# chrome-devtools-mcp is built on demand: the mcp-image-checker builds them on its
+# first pass, or build them by hand:
 #   for f in api worker mcp; do docker build -f klaket/$f.Dockerfile -t klaket-$f:latest ./klaket; done
+#   docker build -t chrome-devtools-mcp:latest ./chrome-devtools
 docker compose up -d
 ```
 

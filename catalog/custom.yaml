@@ -226,6 +226,31 @@ registry:
 
     longLived: true
 
+  chrome-devtools:
+    title: Chrome DevTools
+    type: server
+    image: chrome-devtools-mcp:latest
+    description: >
+      Live Chrome automation and DevTools inspection (Google's
+      chrome-devtools-mcp): open and navigate pages, snapshot the accessible
+      tree, click/fill/type, take screenshots, read console messages and
+      network requests, evaluate scripts and record performance traces with
+      actionable insights. Runs as a gateway-managed container with a real
+      Chrome for Testing build; headless, throwaway profile, no telemetry and
+      no CrUX lookups. Screenshots written under /tmp are visible to
+      telegram-notify and local-image-reader.
+
+    # /tmp is the container's OS temp dir and the only writable root the
+    # server's file tools may use (it expects MCP roots, which most clients do
+    # not negotiate). Mounted rw at the same path so screenshots/downloads
+    # land on the host /tmp where the other servers can reach them — the same
+    # reason playwright mounts it, and why /tmp is already in
+    # MCP_GATEWAY_DOCKER_BIND_ALLOW_WRITABLE_PATHS.
+    volumes:
+      - "/tmp:/tmp:rw"
+
+    longLived: true
+
   local-image-reader:
     title: Local Image Reader
     type: server

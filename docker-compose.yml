@@ -12,6 +12,7 @@ services:
       - ./telegram-notify:/opt/telegram-notify:ro
       - ./local-image-reader:/opt/local-image-reader:ro
       - ./playwright:/opt/playwright:ro
+      - ./chrome-devtools:/opt/chrome-devtools:ro
       - ./torproxy:/opt/torproxy:ro
       - ./klaket:/opt/klaket:ro
     environment:
@@ -34,7 +35,8 @@ services:
             golang:1.23-alpine \
             python:3.12-slim \
             alpine:3.20 \
-            ghcr.io/oraios/serena:latest
+            ghcr.io/oraios/serena:latest \
+            node:22-bookworm-slim
           do
             if docker image inspect "$$image" >/dev/null 2>&1; then
               echo "OK: $$image"
@@ -103,6 +105,21 @@ services:
               -t playwright-mcp:latest \
               /opt/playwright \
               || echo "ERROR building playwright-mcp:latest"
+          fi
+
+          echo "--- Chrome DevTools MCP ---"
+
+          if docker image inspect chrome-devtools-mcp:latest >/dev/null 2>&1; then
+            echo "OK: chrome-devtools-mcp:latest"
+          else
+            echo "MISSING: chrome-devtools-mcp:latest"
+            echo "Building chrome-devtools-mcp:latest..."
+
+            docker build \
+              --pull \
+              -t chrome-devtools-mcp:latest \
+              /opt/chrome-devtools \
+              || echo "ERROR building chrome-devtools-mcp:latest"
           fi
 
           echo "--- Local Image Reader MCP ---"
@@ -335,6 +352,7 @@ services:
       - --servers=context7
       - --servers=model-council
       - --servers=playwright
+      - --servers=chrome-devtools
       - --servers=local-image-reader
       - --servers=klaket
       - --verify-signatures=false
