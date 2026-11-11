@@ -33,7 +33,7 @@ A self-hosted, Docker Compose-based stack that runs the [Docker MCP Gateway](htt
 | Service | Image | Purpose |
 |---|---|---|
 | `mcp-gateway` | `docker/mcp-gateway:latest` | Central MCP gateway (streamable-HTTP on port 8811, exposed as `127.0.0.1:8813`) |
-| `mcp-session-proxy` | `python:3.12-alpine` | Reverse proxy that heals MCP sessions: owns one upstream session, hands clients a **stable session id**, and transparently re-initializes on upstream 404 (`session not found`) |
+| `mcp-session-proxy` | `python:3.12-alpine` | Reverse proxy that heals MCP sessions: owns one upstream session, hands clients a **stable session id**, transparently re-initializes on upstream 404 (`session not found`), and after 15 min without traffic releases the upstream session so the gateway stops the idle `longLived` child containers (browsers included) — they cold-start again on the next call |
 | `searxng` | `searxng/searxng:latest` | Privacy-respecting metasearch engine, used by the SearXNG MCP server |
 | `valkey` | `valkey/valkey:9-alpine` | Limiter/botdetection backend for SearXNG (disabled); search results are cached in SQLite on the `searxng-cache` volume |
 | `chroma` | `chromadb/chroma:latest` | ChromaDB vector store, used by the Chroma MCP server for persistent semantic memory |
@@ -42,6 +42,18 @@ A self-hosted, Docker Compose-based stack that runs the [Docker MCP Gateway](htt
 | `klaket-api` | `klaket-api:latest` (local build, `klaket/`) | Klaket job API (Go): accepts ingest requests, queues them on Redis, serves status/result/export |
 | `klaket-worker` | `klaket-worker:latest` (local build, `klaket/`) | Offline media pipeline: ffmpeg + faster-whisper + sherpa-onnx diarization + OpenCV scenes + OCR. No torch |
 | `model-council-sync` | `python:3.12-alpine` | Keeps the council roster in step with LiteLLM: exactly two pinned seats — `gpt4free/auto` (g4f's AnyProvider router) and `openrouter/free` — seated as soon as LiteLLM lists them and never probed; no static members — anything no rule claims is dropped; restarts the gateway only when the roster actually changed |
+
+### Idle release
+
+The gateway keeps one container per `longLived` server for as long as an MCP
+session is open, so a permanently open session means permanently resident
+Chromium/Chrome instances. `mcp-session-proxy` closes its upstream session after
+`MCP_PROXY_IDLE_TTL` seconds (900 by default) without client traffic: the
+gateway then stops all the children it cached for that session, and the next
+tool call re-initializes and starts only the container it needs. See
+[`session-proxy/README.md`](session-proxy/README.md#idle-release-why-ram-is-not-pinned).
+While a server is idle its tool list still comes from the catalog, so clients
+see all servers at all times.
 
 ### MCP servers registered in the gateway
 

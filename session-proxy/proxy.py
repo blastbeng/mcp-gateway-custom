@@ -24,12 +24,22 @@ that drive the session lifecycle are answered locally:
   everything else           -> forwarded over the proxy's upstream session,
                                auto re-init + single retry on 404
 
+Idle release (MCP_PROXY_IDLE_TTL): the gateway caches one long-lived child
+container per (server, session) for every `longLived: true` catalog entry and
+keeps it until the session closes. When this proxy closes the upstream session
+after N seconds without client traffic, the gateway stops those children
+(clientpool.ReleaseClientsForSession -> ClientSession.Close -> docker run's
+stdin closes -> --rm container exits). The next tool call re-initializes the
+session and starts only the container it needs, so Chromium/Chrome and the
+other long-lived MCP servers no longer sit in RAM while nobody is using them.
+
 Stdlib only (no deps). Run: python3 proxy.py  (env overrides below)
 """
 import json
 import os
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -43,6 +53,17 @@ LISTEN_PORT = int(os.environ.get("MCP_PROXY_PORT", "8812"))
 # 120s window, so this must stay comfortably above the slowest legitimate
 # tool call.  Override with MCP_PROXY_UPSTREAM_TIMEOUT.
 UPSTREAM_TIMEOUT = int(os.environ.get("MCP_PROXY_UPSTREAM_TIMEOUT", "600"))
+
+# Idle release: seconds of client silence after which the upstream session is
+# closed, which makes the gateway stop the long-lived child containers it keeps
+# for this session. 0 disables it (upstream session then lives until restart).
+# The first tool call after a release pays a cold start (0.3-1s for the
+# python/node servers, a few seconds for the browser ones) and the browser
+# state (open page, cookies) is gone — keep the TTL above the longest pause
+# inside a single agent task.
+IDLE_TTL = int(os.environ.get("MCP_PROXY_IDLE_TTL", "0"))
+IDLE_SWEEP = max(1.0, float(os.environ.get("MCP_PROXY_IDLE_SWEEP", "30")))
+
 TOKEN = ""
 _envpath = os.environ.get("MCP_PROXY_ENV", "/opt/docker/compose/mcp/.env")
 try:
@@ -61,6 +82,8 @@ CLIENT_HEADERS = {"Content-Type": "application/json", "Accept": "application/jso
 _lock = threading.Lock()
 _up_sid = None          # upstream Mcp-Session-Id
 _init_result = None     # cached initialize result object (capabilities/serverInfo)
+_inflight = 0           # forwarded POSTs currently waiting on the gateway
+_last_activity = time.monotonic()   # last client traffic (monotonic clock)
 
 
 def _upstream(headers, body=None, method="POST", timeout=UPSTREAM_TIMEOUT):
@@ -135,6 +158,70 @@ def _ensure_session(force=False):
         return _up_sid
 
 
+def _touch():
+    """Record client traffic. Callers must NOT hold _lock."""
+    global _last_activity
+    with _lock:
+        _last_activity = time.monotonic()
+
+
+def _begin_request():
+    """Mark a forwarded request in flight so idle release never interrupts it."""
+    global _inflight, _last_activity
+    with _lock:
+        _inflight += 1
+        _last_activity = time.monotonic()
+
+
+def _end_request():
+    global _inflight, _last_activity
+    with _lock:
+        _inflight -= 1
+        _last_activity = time.monotonic()
+
+
+def _delete_upstream(sid, reason):
+    """Close one upstream session; the gateway then stops its child containers."""
+    status, _hdrs, _data, err = _upstream({**CLIENT_HEADERS, "Mcp-Session-Id": sid},
+                                          None, method="DELETE", timeout=30)
+    sys.stderr.write("[mcp-session-proxy] released upstream session %s (%s): HTTP %s%s\n"
+                     % (sid, reason, status, " err=%s" % err if err else ""))
+
+
+def _take_idle_session():
+    """Atomically return (sid, idle_seconds) when the session is releasable.
+
+    Clearing _up_sid under the same lock means a request that arrives right
+    after this point initializes a NEW session, so the DELETE below can only
+    ever hit the abandoned one.
+    """
+    global _up_sid
+    if IDLE_TTL <= 0:
+        return None
+    with _lock:
+        if _up_sid is None or _inflight > 0:
+            return None
+        idle = time.monotonic() - _last_activity
+        if idle < IDLE_TTL:
+            return None
+        sid, _up_sid = _up_sid, None
+        return sid, idle
+
+
+def _idle_sweeper():
+    """Release the upstream session after IDLE_TTL seconds without client traffic."""
+    while True:
+        time.sleep(IDLE_SWEEP)
+        try:
+            taken = _take_idle_session()
+            if taken is None:
+                continue
+            sid, idle = taken
+            _delete_upstream(sid, "idle %ds" % int(idle))
+        except Exception as e:  # never let the sweeper die
+            sys.stderr.write("[mcp-session-proxy] idle sweeper error: %s\n" % e)
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -179,6 +266,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         global _init_result
+        _touch()
         try:
             length = int(self.headers.get("Content-Length") or 0)
             raw = self.rfile.read(length) if length else b""
@@ -208,7 +296,11 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return
 
-        status, hdrs, data = self._forward_with_heal(raw)
+        _begin_request()
+        try:
+            status, hdrs, data = self._forward_with_heal(raw)
+        finally:
+            _end_request()
         # notifications have no id -> gateway replies 202/empty; relay as-is
         self._send(status, hdrs, data)
 
@@ -221,6 +313,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         # streamable-HTTP GET opens the server->client SSE stream; open an
         # upstream stream over our session and relay it verbatim.
+        # NOTE: the relay itself is not counted as in-flight: a client may keep
+        # this stream open for hours, and it must not pin the session (and the
+        # containers) alive. Releasing the session simply ends the stream.
+        _touch()
         sid = _ensure_session()
         if sid is None:
             self._send(502, {"Content-Type": "text/plain"}, b"proxy upstream unavailable")
@@ -265,9 +361,16 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     # warm the upstream session at boot (also validates the gateway is up)
     _ensure_session()
+    if IDLE_TTL > 0:
+        threading.Thread(target=_idle_sweeper, name="idle-sweeper", daemon=True).start()
     srv = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), Handler)
     srv.daemon_threads = True
     sys.stderr.write(f"[mcp-session-proxy] listening on {LISTEN_HOST}:{LISTEN_PORT} -> {UPSTREAM}\n")
+    if IDLE_TTL > 0:
+        sys.stderr.write(f"[mcp-session-proxy] idle release after {IDLE_TTL}s of client silence "
+                         f"(sweep every {IDLE_SWEEP}s)\n")
+    else:
+        sys.stderr.write("[mcp-session-proxy] idle release disabled (MCP_PROXY_IDLE_TTL=0)\n")
     srv.serve_forever()
 
 

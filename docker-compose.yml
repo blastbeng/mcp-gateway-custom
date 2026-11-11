@@ -525,6 +525,13 @@ services:
       MCP_PROXY_UPSTREAM_TIMEOUT: "900"
       MCP_PROXY_HOST: "0.0.0.0"
       MCP_PROXY_PORT: "8812"
+      # Idle release: the gateway keeps one child container per `longLived`
+      # server for as long as our upstream session lives (browsers: Chromium
+      # included). After 15 min with no client traffic the proxy DELETEs the
+      # session, the gateway stops those children, and the next tool call
+      # re-initializes and starts only the container it needs. 0 disables.
+      MCP_PROXY_IDLE_TTL: "900"
+      MCP_PROXY_IDLE_SWEEP: "30"
     ports:
       - "8811:8812"
       - "8812:8812"
