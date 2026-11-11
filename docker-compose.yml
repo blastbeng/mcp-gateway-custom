@@ -16,7 +16,7 @@ services:
       - ./torproxy:/opt/torproxy:ro
       - ./klaket:/opt/klaket:ro
     environment:
-      CHECK_INTERVAL: "3600"
+      CHECK_INTERVAL: "86400"
     command:
       - sh
       - -c
