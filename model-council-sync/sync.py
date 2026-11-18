@@ -94,6 +94,7 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import random
 import re
 import shutil
 import socket
@@ -125,6 +126,16 @@ DOCKER_SOCK = os.environ.get("DOCKER_SOCK", "/var/run/docker.sock")
 # small_keywords: size fallback when the name carries no parameter count
 # allow    : regex (searched) on the model's last segment, narrowing
 #            candidates further — e.g. ":free$" for openrouter
+# deny     : regex (searched) on the model's last segment; a candidate that
+#            matches is skipped without a probe — for ids a chat completion
+#            can only reject (image, tts, audio, embedding, guard endpoints),
+#            which would otherwise burn probes and candidate strikes. It
+#            narrows admission only: an existing seat is not struck out by it
+# max_seats: at most this many seats for the rule (null = unlimited). At the
+#            cap the rule's candidates are not probed at all; below it the
+#            seats are drawn AT RANDOM from the candidates that answered, so
+#            the roster is a sample of what works, not whatever sorts first.
+#            The cap governs admission: lowering it does not evict a seat
 # free     : "always" (free by construction, probe = aliveness only) or
 #            "probe" (probe decides free vs paid); either way a candidate
 #            is seated only on a probe that really answers ("ok")
@@ -143,23 +154,44 @@ DOCKER_SOCK = os.environ.get("DOCKER_SOCK", "/var/run/docker.sock")
 #            AnyProvider router (Model("auto", base_provider=AnyProvider)).
 DEFAULT_RULES = {
     "rules": [
-        # The council holds exactly two seats: gpt4free's AnyProvider auto
-        # router (Model("auto", base_provider=AnyProvider)) and LiteLLM's
-        # free OpenRouter alias. Everything else a provider exposes is
-        # unclaimed and therefore dropped from the roster.
-        #
-        # Both are pinned: membership follows LiteLLM's listing alone — no
-        # probe, no strike-out. Besides being the only two seats (a flaky
-        # 1-token probe must not empty the council), it keeps the sync from
-        # exercising the whole gpt4free provider chain every hour, which on
-        # this host drives gpt4free-chromium into OOM and takes the stack
-        # down with it.
+        # gpt4free's AnyProvider auto router (Model("auto", base_provider=
+        # AnyProvider)) and LiteLLM's free OpenRouter alias. Both are pinned:
+        # membership follows LiteLLM's listing alone — no probe, no
+        # strike-out. A flaky 1-token probe must not empty the council, and
+        # pinning keeps the sync from exercising the whole gpt4free provider
+        # chain every hour, which on this host drives gpt4free-chromium into
+        # OOM and takes the stack down with it.
         {"id": "gpt4free", "pattern": r"^(?:gpt4free|g4f)/auto$",
          "max_params_b": None, "free": "always",
          "pin": [r"(?:^|/)auto$"]},
         {"id": "openrouter", "pattern": r"^openrouter/free$",
          "max_params_b": None, "free": "always",
          "pin": [r"(?:^|/)free$"]},
+
+        # The families behind the LiteLLM relay, one rule each: max_seats 4,
+        # drawn at random from the models that actually answer a probe (only
+        # "ok" is ever seated — a 429, a 402 or a timeout never is).
+        # max_params_b 32 keeps the council on small, cheap models; deny
+        # filters the ids a chat completion can only reject, so the probe
+        # budget is not spent on image/tts/audio/embedding/guard endpoints.
+        {"id": "groq", "pattern": r"^groq/", "max_params_b": 32,
+         "max_seats": 4, "free": "probe",
+         "deny": r"whisper|orpheus|prompt-guard|tts|audio|embed"},
+        {"id": "gemini", "pattern": r"^gemini/", "max_params_b": 32,
+         "max_seats": 4, "free": "probe",
+         "deny": r"image|tts|audio|live|transcribe|embedding|lyria|robotics|"
+                 r"computer-use|deep-research|banana|omni|aqa|decision|"
+                 r"antigravity|clip|realtime|veo|imagen"},
+        # ollama-cloud is paid today — every probe answers 402 "add usage
+        # credits" — so the rule seats nothing and sends the rejects on the
+        # usual candidate cooldown. It fills its own seats the cycle credits
+        # appear: the rule needs no edit for that.
+        {"id": "ollama-cloud", "pattern": r"^ollama-cloud/", "max_params_b": 32,
+         "max_seats": 4, "free": "probe",
+         "deny": r"clef|decision"},
+        {"id": "cloudflare", "pattern": r"^cloudflare/", "max_params_b": 32,
+         "max_seats": 4, "free": "probe",
+         "deny": r"guard|embedding|bge|whisper|tts|stable-diffusion|flux"},
     ]
 }
 
@@ -259,8 +291,10 @@ def load_rules() -> list[dict]:
                 "id": str(r.get("id", pattern.pattern)),
                 "pattern": pattern,
                 "max_params_b": None if r.get("max_params_b") is None else float(r["max_params_b"]),
+                "max_seats": None if r.get("max_seats") is None else max(1, int(r["max_seats"])),
                 "small_keywords": tuple(r.get("small_keywords") or _SMALL_KEYWORDS),
                 "allow": re.compile(r["allow"]) if r.get("allow") else None,
+                "deny": re.compile(r["deny"]) if r.get("deny") else None,
                 "free": free,
                 "probe_existing": bool(r.get("probe_existing", True)),
                 "pin": tuple(re.compile(p) for p in pins),
@@ -650,7 +684,23 @@ def sync_cycle() -> None:
             log(f"rule {rule['id']}: {ok_n}/{len(verdicts)} owned seats healthy")
 
     # Candidates: live models a rule claims, not seated yet. Size first
-    # (free), then the allow filter, then the probe (concurrent, bounded).
+    # (free), then the allow/deny filters, then the probe (concurrent,
+    # bounded). A rule with max_seats holds at most that many seats: at the
+    # cap it is not probed at all, and below it the seats are drawn at
+    # random from the candidates that answered — a sample of what works,
+    # not "whatever sorts first".
+    seats_held: dict[str, int] = {}
+    for rule, _ in owned.values():
+        seats_held[rule["id"]] = seats_held.get(rule["id"], 0) + 1
+    slots: dict[str, int] = {}          # -1 = unlimited
+    for rule in rules:
+        cap = rule["max_seats"]
+        held = seats_held.get(rule["id"], 0)
+        slots[rule["id"]] = -1 if cap is None else max(0, cap - held)
+        if cap is not None and held >= cap:
+            log(f"rule {rule['id']}: {held}/{cap} seats (max_seats) — "
+                f"no candidate probing")
+
     todo: list[str] = []
     cand_rule: dict[str, dict] = {}
     added: list[str] = []
@@ -662,7 +712,10 @@ def sync_cycle() -> None:
             continue
         if size_class(model, rule) != "small":
             continue
-        if rule["allow"] and not rule["allow"].search(model.rsplit("/", 1)[-1]):
+        last = model.rsplit("/", 1)[-1]
+        if rule["allow"] and not rule["allow"].search(last):
+            continue
+        if rule["deny"] and rule["deny"].search(last):
             continue
         if is_pinned(model, rule):
             # Membership by catalog alone: no probe, no cooldown, so a
@@ -671,6 +724,8 @@ def sync_cycle() -> None:
             owned[model] = (rule, {"id": model, "provider": "litellm", "model": model})
             added.append(model)
             continue
+        if slots[rule["id"]] == 0:
+            continue                      # the rule is full: nothing to fill
         if not PROBE_ENABLED:
             log(f"candidate {model} skipped: probing disabled")
             continue
@@ -683,6 +738,7 @@ def sync_cycle() -> None:
         todo.append(model)
         cand_rule[model] = rule
     probed = probe_many(base, key, todo)
+    answered: dict[str, list[str]] = {}
     for model in todo:
         verdict, detail = probed[model]
         # Admission is strict and uniform: the model must actually answer
@@ -692,14 +748,28 @@ def sync_cycle() -> None:
         # it, so a throttled model joins the roster as soon as it answers.
         if verdict == "ok":
             state["candidate_strikes"].pop(model, None)
-            owned[model] = (cand_rule[model],
-                            {"id": model, "provider": "litellm", "model": model})
-            added.append(model)
+            answered.setdefault(cand_rule[model]["id"], []).append(model)
         elif verdict == "free":
             log(f"  probe {model} throttled (429) — not seated, retried next cycle")
         else:
             log(f"  probe {model} rejected ({verdict}: {detail})")
             candidate_strike(state, model, verdict)
+    # Admission, per rule: everything that answered when the rule has no cap,
+    # otherwise a random draw from the answering candidates — the unseated
+    # ones answered too, so they get no strike and are simply not picked.
+    for rule in rules:
+        ok = answered.get(rule["id"]) or []
+        if not ok:
+            continue
+        room = slots[rule["id"]]
+        chosen = ok if room < 0 else random.sample(ok, min(room, len(ok)))
+        if 0 <= room < len(ok):
+            log(f"rule {rule['id']}: {len(ok)} candidates answered, seating "
+                f"{len(chosen)} of them at random (max_seats={rule['max_seats']})")
+        for model in sorted(chosen):
+            owned[model] = (rule,
+                            {"id": model, "provider": "litellm", "model": model})
+            added.append(model)
 
     # Candidate-strike entries for models litellm no longer lists are dead
     # weight — the model cannot be probed anyway and would start fresh.

@@ -13,6 +13,38 @@
       "max_params_b": null,
       "free": "always",
       "pin": ["(?:^|/)free$"]
+    },
+    {
+      "id": "groq",
+      "pattern": "^groq/",
+      "max_params_b": 32,
+      "max_seats": 4,
+      "free": "probe",
+      "deny": "whisper|orpheus|prompt-guard|tts|audio|embed"
+    },
+    {
+      "id": "gemini",
+      "pattern": "^gemini/",
+      "max_params_b": 32,
+      "max_seats": 4,
+      "free": "probe",
+      "deny": "image|tts|audio|live|transcribe|embedding|lyria|robotics|computer-use|deep-research|banana|omni|aqa|decision|antigravity|clip|realtime|veo|imagen"
+    },
+    {
+      "id": "ollama-cloud",
+      "pattern": "^ollama-cloud/",
+      "max_params_b": 32,
+      "max_seats": 4,
+      "free": "probe",
+      "deny": "clef|decision"
+    },
+    {
+      "id": "cloudflare",
+      "pattern": "^cloudflare/",
+      "max_params_b": 32,
+      "max_seats": 4,
+      "free": "probe",
+      "deny": "guard|embedding|bge|whisper|tts|stable-diffusion|flux"
     }
   ]
 }
