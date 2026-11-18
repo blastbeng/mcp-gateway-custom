@@ -222,8 +222,8 @@ services:
   # network by service name. Dashboard and Argos translation are left out.
   #
   # Redis is NOT part of this project: Klaket uses the host-wide instance
-  # already running from /opt/docker/compose/redis on 6379 (published on
-  # 0.0.0.0), reached through host.docker.internal. That instance is shared,
+  # already running dalla stack redis su 192.168.1.160 (porta 6379 pubblicata
+  # sulla LAN). Quella istanza e' condivisa,
   # so Klaket gets **db 3** (db0/db1/db2 are already in use by other
   # services). Upstream hardcodes database 0; both Dockerfiles patch
   # REDIS_DB in, and fail the build if the patch stops applying. The instance
@@ -237,7 +237,7 @@ services:
 
     environment:
       # Shared Redis, separate DB — see the note above.
-      REDIS_ADDR: host.docker.internal:6379
+      REDIS_ADDR: 192.168.1.160:6379
       REDIS_DB: "3"
       DATA_DIR: /data
       KLAKET_AUTH: "off"
@@ -277,7 +277,7 @@ services:
     restart: unless-stopped
 
     environment:
-      REDIS_ADDR: host.docker.internal:6379
+      REDIS_ADDR: 192.168.1.160:6379
       REDIS_DB: "3"
       DATA_DIR: /data
 
