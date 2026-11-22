@@ -1,12 +1,37 @@
 use_default_settings:
+  # L5 of the search stack: the always-up, keyless fallback behind the
+  # `websearch` MCP browser lanes.
+  #
+  # Everything that scrapes a general-purpose SERP is gone on purpose. Measured
+  # from this host: duckduckgo answers HTTP 202 with an anomaly page, Brave 429,
+  # Google a /sorry CAPTCHA, Startpage a suspension notice, Mojeek/Ecosia 403 --
+  # and Bing serves a *degraded* page over plain HTTP (only the first keyword is
+  # honoured, or an explicit empty SERP) even though a real browser gets good
+  # results with form=QBLH. Keeping those engines only burned requests and
+  # filled `unresponsive_engines` with noise.
+  #
+  # What is left needs no API key and no bot-friendly IP: curated/direct
+  # indexes (mwmbl, wiby) plus upstream JSON APIs (github, hackernews,
+  # stackoverflow, mdn, pypi, npm, crates.io, arxiv, openalex, crossref).
+  # General-web coverage comes from the `websearch` MCP; this instance is the
+  # fallback that cannot be rate-limited into silence.
   engines:
-    remove:
-      - ahmia
-      - torch
-      - wikidata
+    keep_only:
+      - mwmbl
+      - wiby
+      - github
+      - hackernews
+      - stackoverflow
+      - mdn
+      - pypi
+      - npm
+      - crates.io
+      - arxiv
+      - openalex
+      - crossref
 
 general:
-  instance_name: "Local SearXNG"
+  instance_name: "Local SearXNG (keyless)"
 
 server:
   secret_key: "801a799f4d0298bd53cd7265eeaa7955a9748ba5a2b61ac62c28b963b4aba1f6"
@@ -17,38 +42,53 @@ search:
   formats:
     - html
     - json
+  safe_search: 1
+  # No autocomplete engine survives keep_only; disabling it avoids a request to
+  # a removed engine on every keystroke.
+  autocomplete: ""
 
+# Most of these upstreams ship disabled in SearXNG's defaults (they are niche),
+# so every engine we keep has to be switched on explicitly.
 engines:
-  # Bing is keyless and, measured from this host, answers a plain general/web
-  # query in ~0.6s with ~10 results and no CAPTCHA -- but it ships disabled in
-  # SearXNG's defaults. Enabling it keeps general/web queries alive while
-  # DuckDuckGo is serving a CAPTCHA (which it does under sustained volume).
-  - name: bing
+  - name: mwmbl
     disabled: false
 
-  # The `brave` engine scrapes search.brave.com, which answers scrapers with
-  # HTTP 429 and a byte-identical anti-bot page -- from this host and from a Tor
-  # exit alike. That is bot detection, not an IP quota we could rotate around.
-  # It cannot return results; it only spends a request per query and pollutes
-  # `unresponsive_engines`. Brave-indexed results now come from the keyed
-  # `tavily` server instead. Re-enable if Brave lifts the block.
-  - name: brave
-    disabled: true
+  - name: wiby
+    disabled: false
 
-  # `google cse` cannot be given a key: the engine hardcodes blackle.com's
-  # public CSE id (partner-pub-8993703457585266:4862972284) and scrapes a
-  # token for it, so every SearXNG instance in the world shares one Google
-  # quota. It answers 429 on essentially every query, which only spends a
-  # request and pollutes `unresponsive_engines`. General/web is covered by
-  # bing + duckduckgo, and Brave-indexed results come from the keyed `tavily`
-  # server. Re-enable only if SearXNG ships a keyed Google engine.
-  - name: google cse
-    disabled: true
+  - name: github
+    disabled: false
+
+  - name: hackernews
+    disabled: false
+
+  - name: stackoverflow
+    disabled: false
+
+  - name: mdn
+    disabled: false
+
+  - name: pypi
+    disabled: false
+
+  - name: npm
+    disabled: false
+
+  - name: crates.io
+    disabled: false
+
+  - name: arxiv
+    disabled: false
+
+  - name: openalex
+    disabled: false
+
+  - name: crossref
+    disabled: false
 
 outgoing:
-  # Per-engine timeout: give throttled/slow upstreams a little more room
-  # before SearXNG gives up on them.
-  request_timeout: 5.0
+  # YaCy peers and GitHub's anonymous API are slower than a scraped SERP.
+  request_timeout: 8.0
   pool_connections: 100
   enable_http2: true
 

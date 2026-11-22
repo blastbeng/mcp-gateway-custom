@@ -14,6 +14,8 @@ model-council-data/.sync-state.json
 chroma-data/
 chroma-cache/
 onionclaw-data/
+# websearch MCP query cache + circuit-breaker state
+websearch-data/
 # Klaket job artifacts + downloaded models (whisper, sherpa-onnx, OCR)
 klaket-data/
 klaket-models/

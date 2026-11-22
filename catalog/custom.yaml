@@ -28,47 +28,69 @@ registry:
 
     longLived: true
 
+  websearch:
+    title: Web Search
+    type: server
+    image: websearch-mcp:latest
+    description: >
+      Primary web search, no API keys and no quota: headless Chromium reads
+      DuckDuckGo's HTML endpoint (the strongest keyless SERP from this host:
+      HTTP clients get 202 + an anomaly page, a real browser gets the list),
+      then Bing (form=QBLH — the only variant Bing does not degrade — but this
+      IP starts getting empty SERPs after a few queries), then Marginalia
+      (independent index), then the local keyless SearXNG instance, then
+      Wikipedia / Stack Exchange / Hacker News APIs. Lanes run in order and
+      merge until `count` is reached, so one blocked upstream degrades the
+      answer instead of hanging it; a 24 h cache sits in front and a per-lane
+      circuit breaker skips an engine that keeps failing.
+      Tools: web_search, web_search_status.
+
+    env:
+      - name: SEARXNG_URL
+        value: "http://searxng:8080"
+
+      # SearXNG's default category is `general` only; the keyless engine set is
+      # spread over `it` and `science` (github/mdn/stackoverflow, arxiv/...).
+      - name: SEARXNG_CATEGORIES
+        value: "general,it,science"
+
+      # Survives gateway restarts and idle-child reaping: the cache and the
+      # breaker state are worth more than one process lifetime.
+      - name: CACHE_DIR
+        value: "/var/lib/websearch/cache"
+
+      - name: STATE_DIR
+        value: "/var/lib/websearch/state"
+
+      - name: CACHE_TTL_S
+        value: "86400"
+
+      # A lane may not outlive 20 s, the whole call 45 s: an agent loop must
+      # get an answer even when every upstream is slow.
+      - name: LANE_TIMEOUT_MS
+        value: "20000"
+
+      - name: TOTAL_TIMEOUT_MS
+        value: "45000"
+
+    volumes:
+      - "/opt/docker/compose/mcp/websearch-data:/var/lib/websearch:rw"
+
+    longLived: true
+
   searxng:
+    title: SearXNG (keyless fallback)
     type: server
     image: isokoliuk/mcp-searxng:latest
-    description: Local SearXNG web search MCP server.
+    description: >
+      Always-up fallback: the local SearXNG instance, restricted to engines
+      that need no API key and no bot-friendly IP (see searxng/settings.yml).
+      Also exposes web_url_read for fetching a page, which websearch does not
+      do. Use it when web_search comes back thin or when you already have a URL.
 
     env:
       - name: SEARXNG_URL
         value: http://searxng:8080
-
-  open-websearch:
-    title: Open WebSearch
-    type: server
-    image: ghcr.io/aas-ee/open-web-search:latest
-    description: >
-      Self-hosted multi-engine keyword search (Bing, DuckDuckGo, Brave,
-      Startpage, Exa, Hacker News) with no API keys. Robust fallback to the
-      local SearXNG instance.
-
-    env:
-      - name: MODE
-        value: "stdio"
-
-      - name: DEFAULT_SEARCH_ENGINE
-        value: "duckduckgo"
-
-      - name: ALLOWED_SEARCH_ENGINES
-        value: "duckduckgo,brave,startpage,hackernews,exa"
-
-  tavily:
-    title: Tavily Search
-    type: server
-    image: mcp/tavily:latest
-    description: >
-      Keyed fallback for when the scraped engines throttle or block. The Tavily
-      API is not subject to scraper bot-detection or per-IP CAPTCHA cooldowns,
-      so it answers when SearXNG's brave/duckduckgo/google lanes are down.
-      Provides search, extract, crawl, map and research tools.
-
-    secrets:
-      - name: TAVILY_API_KEY
-        env: TAVILY_API_KEY
 
   telegram-notify:
     title: Telegram Notify

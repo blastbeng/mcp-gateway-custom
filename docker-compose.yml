@@ -11,6 +11,7 @@ services:
       - ./model-council:/opt/model-council:ro
       - ./telegram-notify:/opt/telegram-notify:ro
       - ./local-image-reader:/opt/local-image-reader:ro
+      - ./websearch:/opt/websearch:ro
       - ./playwright:/opt/playwright:ro
       - ./chrome-devtools:/opt/chrome-devtools:ro
       - ./torproxy:/opt/torproxy:ro
@@ -26,8 +27,6 @@ services:
 
           for image in \
             isokoliuk/mcp-searxng:latest \
-            ghcr.io/aas-ee/open-web-search:latest \
-            mcp/tavily:latest \
             mcp/fetch:latest \
             mcp/chroma:latest \
             mcp/playwright:latest \
@@ -135,6 +134,21 @@ services:
               -t local-image-reader-mcp:latest \
               /opt/local-image-reader \
               || echo "ERROR building local-image-reader-mcp:latest"
+          fi
+
+          echo "--- Web Search MCP (headless Chromium + keyless lanes) ---"
+
+          if docker image inspect websearch-mcp:latest >/dev/null 2>&1; then
+            echo "OK: websearch-mcp:latest"
+          else
+            echo "MISSING: websearch-mcp:latest"
+            echo "Building websearch-mcp:latest..."
+
+            docker build \
+              --pull \
+              -t websearch-mcp:latest \
+              /opt/websearch \
+              || echo "ERROR building websearch-mcp:latest"
           fi
 
           echo "--- Klaket (offline audio/video) ---"
@@ -342,9 +356,8 @@ services:
       - --transport=streaming
       - --port=8811
       - --catalog=/root/.docker/mcp/catalogs/custom.yaml
+      - --servers=websearch
       - --servers=searxng
-      - --servers=open-websearch
-      - --servers=tavily
       - --servers=telegram-notify
       - --servers=fetch
       - --servers=chroma
@@ -372,7 +385,10 @@ services:
       # i.e. never in /var/lib/docker on the small root fs); rw needs this list.
       # /tmp is here for playwright's output dir (screenshots/downloads land in
       # the shared host /tmp, rw); /tmp is already in the RO allowlist above.
-      MCP_GATEWAY_DOCKER_BIND_ALLOW_WRITABLE_PATHS: "/opt/docker/compose/mcp/chroma-data:/opt/docker/compose/mcp/chroma-cache:/opt/docker/compose/mcp/onionclaw-data:/opt/blast/cache/ms-playwright-mcp:/opt/blast/cache/ms-playwright:/tmp"
+      # websearch-data keeps the query cache and the circuit-breaker state
+      # across container restarts (the gateway stops idle children), so a
+      # breaker that opened on a throttled IP does not have to be relearned.
+      MCP_GATEWAY_DOCKER_BIND_ALLOW_WRITABLE_PATHS: "/opt/docker/compose/mcp/chroma-data:/opt/docker/compose/mcp/chroma-cache:/opt/docker/compose/mcp/onionclaw-data:/opt/docker/compose/mcp/websearch-data:/opt/blast/cache/ms-playwright-mcp:/opt/blast/cache/ms-playwright:/tmp"
 
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock

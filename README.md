@@ -34,7 +34,7 @@ A self-hosted, Docker Compose-based stack that runs the [Docker MCP Gateway](htt
 |---|---|---|
 | `mcp-gateway` | `docker/mcp-gateway:latest` | Central MCP gateway (streamable-HTTP on port 8811, exposed as `127.0.0.1:8813`) |
 | `mcp-session-proxy` | `python:3.12-alpine` | Reverse proxy that heals MCP sessions: owns one upstream session, hands clients a **stable session id**, transparently re-initializes on upstream 404 (`session not found`), and after 15 min without traffic releases the upstream session so the gateway stops the idle `longLived` child containers (browsers included) — they cold-start again on the next call |
-| `searxng` | `searxng/searxng:latest` | Privacy-respecting metasearch engine, used by the SearXNG MCP server |
+| `searxng` | `searxng/searxng:latest` | Metasearch engine restricted to keyless engines (`searxng/settings.yml`): the always-up fallback behind the `websearch` MCP |
 | `valkey` | `valkey/valkey:9-alpine` | Limiter/botdetection backend for SearXNG (disabled); search results are cached in SQLite on the `searxng-cache` volume |
 | `chroma` | `chromadb/chroma:latest` | ChromaDB vector store, used by the Chroma MCP server for persistent semantic memory |
 | `torproxy` | `torproxy:latest` (local build, `torproxy/`) | SOCKS5 (9050) + HTTP (8118) Tor proxy, used by OnionClaw. Built on Alpine with Tor 0.4.9: `dperson/torproxy` is frozen at Tor 0.4.4, which the network rejects (`Desc=3`/`Microdesc=3`) |
@@ -61,9 +61,8 @@ Defined in [`catalog/custom.yaml`](catalog/custom.yaml) as a custom catalog (`lo
 
 | Server | Type | Description |
 |---|---|---|
-| `searxng` | Local | Web search through the local SearXNG instance |
-| `open-websearch` | Local | Self-hosted multi-engine keyword search (Bing, DuckDuckGo, Brave, Startpage, Exa, Hacker News), no API keys — robust fallback to SearXNG |
-| `tavily` | Local | Keyed search fallback (`TAVILY_API_KEY`, free tier, no card): search, extract, crawl, map, research — immune to scraper bot-detection and per-IP CAPTCHA cooldowns |
+| `websearch` | Local | **Primary web search** — no API key, no quota: headless Chromium reads DuckDuckGo's HTML endpoint, then Bing, Marginalia, the local keyless SearXNG instance, and Wikipedia / Stack Exchange / Hacker News APIs; 24 h cache + per-lane circuit breaker + hard timeouts. Tools: `web_search`, `web_search_status` |
+| `searxng` | Local | **Always-up fallback** — the local SearXNG instance on keyless engines only, plus `web_url_read` for fetching a page you already have a URL for |
 | `telegram-notify` | Local | One-way Telegram notifications: one fixed bot, one fixed chat id (`TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID`) — task-finished, needs-attention and Open WebUI automation alerts |
 | `chroma` | Local | Persistent semantic vector memory (project knowledge, architectural decisions, code patterns) |
 | `onionclaw` | Local | **OnionClaw / SICRY** — Tor and dark-web OSINT: multi-engine onion search, .onion fetch/crawl, engine health checks, structured OSINT export |
@@ -83,6 +82,7 @@ Defined in [`catalog/custom.yaml`](catalog/custom.yaml) as a custom catalog (`lo
 | [`telegram-notify/`](telegram-notify/) | `telegram-notify-mcp:latest` | Thin wrapper on `node:22-alpine`: installs the `telegram-notifier-mcp` npm package (pinned) |
 | [`local-image-reader/`](local-image-reader/) | `local-image-reader-mcp:latest` | Thin wrapper on `python:3.12-slim`: installs the `mcp-local-image-reader` PyPI package (pinned, `mcp<2`) |
 | [`playwright/`](playwright/) | `playwright-mcp:latest` | Thin wrapper on `mcp/playwright:latest`: clears the stale Chromium `SingletonLock` before exec |
+| [`websearch/`](websearch/) | `websearch-mcp:latest` | Primary search: `mcp/playwright:latest` plus hand-written stdio JSON-RPC (`server.cjs`, `search.cjs`, `browser.cjs`) — no npm install, no SDK |
 | [`chrome-devtools/`](chrome-devtools/) | `chrome-devtools-mcp:latest` | Node 22 image with Chrome for Testing + the `chrome-devtools-mcp` npm package (both resolved fresh at build time) |
 | [`klaket/`](klaket/) | `klaket-api:latest`, `klaket-worker:latest`, `klaket-mcp:latest` | Three images from the pinned upstream tag `v0.7.1` ([huseyinstif/klaket](https://github.com/huseyinstif/klaket)): Go API, Python worker, stdio MCP server |
 
@@ -97,8 +97,6 @@ All secrets live in a `.env` file at the repo root — **it is git-ignored and m
 ```dotenv
 # Auth token required by the MCP gateway / session proxy
 MCP_GATEWAY_AUTH_TOKEN=change-me
-# Tavily Search API key (server `tavily`); free tier, no credit card
-TAVILY_API_KEY=
 # Telegram notifications (server `telegram-notify`): bot token + the ONE chat
 # that may be notified. On this host both are copied from
 # /opt/docker/compose/discord-llm-bot/.env.telegram (`TELOXIDE_TOKEN`,
@@ -107,7 +105,7 @@ TELEGRAM_BOT_TOKEN=
 TELEGRAM_CHAT_ID=
 ```
 
-This same file is mounted read-only into the gateway as `--secrets`, so any key added here is injected into the matching MCP server container at spawn time. A secret that is missing degrades to `<UNKNOWN>` rather than crashing the gateway, which is why the `tavily` server can be registered before a key exists.
+This same file is mounted read-only into the gateway as `--secrets`, so any key added here is injected into the matching MCP server container at spawn time. A secret that is missing degrades to `<UNKNOWN>` rather than crashing the gateway. No search server needs one: both `websearch` and `searxng` are keyless by design.
 
 The Model Council server reads its API key from [`model-council-data/config.json`](model-council-data/config.example.json) — see below.
 
@@ -153,34 +151,81 @@ The council server reads its roster **once at startup**, while the providers beh
 
 Rule knobs (defaults: the `gpt4free` rule owns `^(?:gpt4free|g4f)/auto$`, the `openrouter` rule owns `^openrouter/free$`): `pattern` (there is no `exclude` knob — an unclaimed member is a static leftover and is dropped), `max_params_b`, `small_keywords`, `allow` (regex *searched* against the model's last segment), `free` (`always` = free by construction; `probe` = the probe decides free vs paid), `pin` (regexes on the full model id: a pinned model is seated as soon as LiteLLM lists it, is never probed and no probe verdict can strike it out; it still leaves when LiteLLM stops listing it — **both default seats are pinned**, which also keeps the hourly sync from exercising g4f's whole provider chain: on this host that drove `gpt4free-chromium` into OOM), `probe_existing` (re-check owned seats every cycle; pinned seats are never re-probed). Probes run concurrently (`PROBE_WORKERS`). Global env knobs: `SYNC_INTERVAL`, `REMOVE_AFTER_MISSES`, `CANDIDATE_STRIKES`, `CANDIDATE_RETRY_HOURS`, `PROBE_ENABLED`, `PROBE_TIMEOUT`, `PROBE_WORKERS`, `RESTART_GATEWAY`, `GATEWAY_CONTAINER`, `LITELLM_BASE_URL`/`LITELLM_API_KEY`.
 
-### SearXNG
+### Web Search (`websearch`)
 
-`searxng/settings.yml` is bind-mounted read/write into the container (SearXNG regenerates/updates it at startup). Search results are cached in SQLite on the `searxng-cache` volume; the `valkey` container backs only the limiter/botdetection (currently disabled), **not** the search cache. The `outgoing` block raises the per-engine timeout so throttled upstreams still get a chance to answer.
+Primary search path, in [`websearch/`](websearch/), built locally as
+`websearch-mcp:latest` (`mcp/playwright` as the base, so there is no npm install
+and no build step: `server.cjs` speaks newline-delimited JSON-RPC over stdio by
+hand).
 
-Two engine overrides in `settings.yml` back the general/web category:
+Lanes run **in order**, merging until `count` results are collected (so a
+`count` of 8 usually costs one browser request, not three):
 
-- **`bing` is enabled** (`disabled: false`). Bing ships disabled in SearXNG's defaults but is keyless and, measured on this host, answers a general/web query in ~0.6 s with ~10 results and no CAPTCHA. It keeps Web searches alive while DuckDuckGo is in a CAPTCHA cooldown.
-- **`brave` is disabled.** The engine scrapes `search.brave.com`, which now answers scrapers with HTTP 429 and a byte-identical anti-bot page — from this host **and** from a Tor exit, so it is bot detection rather than an IP quota we could rotate around. It cannot return results, so it only spent a request per query. Brave-indexed results come from the keyed `tavily` server instead; re-enable the engine if Brave lifts the block.
+| Lane | What it is | Why it is here |
+|---|---|---|
+| `duckduckgo` | headless Chromium on `html.duckduckgo.com/html/` | the strongest keyless SERP from this host. Plain HTTP clients get HTTP 202 + an anomaly page; a real browser gets a normal list (`result__a` / `result__snippet`) in ~1-2 s with ten on-topic results. Paced (`DDG_MIN_INTERVAL_S`, 3 s) and budgeted (`DDG_MAX_PER_HOUR`, 150) because it is still somebody else's endpoint |
+| `bing` | headless Chromium on `bing.com/search?form=QBLH` | second opinion with broader coverage: `form=QBLH` is the only Bing variant that is not degraded (over plain HTTP Bing honours just the first keyword, and `format=rss` returns unrelated results). **This IP gets throttled**: after a handful of queries Bing answers "There are no results for ..." (`li.b_no`), so the lane is paced (`BING_MIN_INTERVAL_S`, 8 s), budgeted (`BING_MAX_PER_HOUR`, 40) and three empty SERPs trip its breaker |
+| `marginalia` | headless Chromium on `marginalia-search.com` | independent index (small/curated web), no key, ~2 s JS bot gate |
+| `searxng` | local SearXNG JSON API | the L5 fallback, `categories=general,it,science` (see below) |
+| `wikipedia`, `stackexchange`, `hn` | official JSON APIs | keyless tail that cannot be bot-blocked; always answers |
 
-Routing SearXNG's engines through the Tor proxy was evaluated and **rejected**: it buys nothing for `duckduckgo` (which answers fine from the host IP until it hits a volume-based CAPTCHA) and actively degrades `bing` (10 result blocks direct vs 0 via Tor).
+Behaviour that makes it usable from an agent loop:
 
-### Open WebSearch
+- **hard timeouts** — `LANE_TIMEOUT_MS` (20 s) per lane, `TOTAL_TIMEOUT_MS`
+  (45 s) for the whole call; a lane that misses its budget is recorded and the
+  next one runs, so a throttled upstream can never make the tool hang;
+- **24 h cache** — file cache on `/var/lib/websearch/cache`
+  (`CACHE_TTL_S`, `CACHE_MAX` entries, oldest swept out), so repeating a query
+  is instant and does not spend a DuckDuckGo/Bing budget slot;
+- **per-lane circuit breaker** — `BREAKER_THRESHOLD` consecutive real failures
+  (or empty SERPs) open a lane for `BREAKER_COOLDOWN_S` (10 min); the state
+  persists in `/var/lib/websearch/state/breakers.json`, so a blocked IP is not
+  relearned after every container restart;
+- **one shared Chromium** (one browser, one page, requests serialised) so
+  concurrent tool calls cannot fight over the page or multiply RAM;
+- **no summaries, no truncation by engine** — every result carries `title`,
+  `url`, `snippet` and the `engine` that produced it, and the reply reports the
+  per-lane outcome (`lanes: [{name, status, ms, results}]`).
 
-`open-websearch` runs as a gateway-managed local server (`ghcr.io/aas-ee/open-web-search:latest`, `MODE=stdio`) and provides a second, independent keyword-search path when the scraped SearXNG engines throttle. Its `search` tool takes an `engines` argument (`duckduckgo`, `brave`, `startpage`, `hackernews`, `exa`); no API keys are required.
+`web_search_status` returns the lane list, breaker state, last run per lane and
+cache size — the first thing to look at when a search comes back thin.
 
-It is **keyless, therefore still scraped**: it has no API-key support at all, so it shares SearXNG's upstream blocks and its `brave` engine returns the same 429. Its `duckduckgo`/`bing` lanes work; it is a second *lane*, not a different *kind* of access. For access that does not depend on scraping at all, use `tavily` below.
+Volume: `/opt/docker/compose/mcp/websearch-data` (cache + breaker state, owned
+by uid 1000 like the rest of the local MCP images). It is in
+`MCP_GATEWAY_DOCKER_BIND_ALLOW_WRITABLE_PATHS`; the directory is git-ignored.
 
-### Tavily Search
+### SearXNG (keyless fallback)
 
-`tavily` runs as a gateway-managed local server (`mcp/tavily:latest`, stdio) and is the only search path here that is not scraping: it calls the Tavily API, so it is unaffected by bot detection or per-IP CAPTCHA cooldowns.
+`searxng/settings.yml` is bind-mounted into the container and restricts the
+instance to engines that need **no API key and no bot-friendly IP**:
+`mwmbl`, `wiby`, `github`, `hackernews`, `stackoverflow`, `mdn`, `pypi`, `npm`,
+`crates.io`, `arxiv`, `openalex`, `crossref` (12 engines, all explicitly
+`disabled: false` — most ship disabled in SearXNG's defaults).
 
-Enable it by putting a key in `.env` (the gateway injects it from there — see [Secrets](#secrets-env)):
+Every general-purpose SERP scraper was **removed on purpose**, measured from this
+host: DuckDuckGo answers HTTP 202 with an anomaly page, Brave 429, Google a
+`/sorry` CAPTCHA, Startpage a suspension notice, Mojeek an ALTCHA JavaScript
+challenge, Ecosia 403, and Bing a degraded page over HTTP. Keeping them only
+spent a request per query and filled `unresponsive_engines` with noise. (DDG is
+served to the `websearch` browser lane instead: the same endpoint answers a
+real browser.) General-web coverage is what the
+`websearch` MCP adds; this instance is the fallback that cannot be
+rate-limited into silence.
 
-```dotenv
-TAVILY_API_KEY=tvly-...
-```
+Two details worth knowing:
 
-The free tier is 1,000 credits/month with **no credit card** ([app.tavily.com](https://app.tavily.com)); a basic search costs 1 credit, an advanced search 2. The server exposes `tavily_search`, `tavily_extract`, `tavily_crawl`, `tavily_map` and `tavily_research`. Until a key is set the server still registers and the gateway logs a benign `Secret 'TAVILY_API_KEY' not found` warning when the server is first spawned.
+- SearXNG's default category is `general` only, which on this engine set means
+  `mwmbl` + `wiby`. The engine mix is spread over `it` (github, mdn,
+  stackoverflow, ...) and `science` (arxiv, openalex, crossref), so callers
+  should ask for `categories=general,it,science` — `websearch` does
+  (measured on the query `python asyncio timeout`: 85 results from 2 engines
+  with the default category, 191 from 10 engines with all three, zero
+  unresponsive).
+- The `valkey` container backs only the limiter/botdetection, which is disabled;
+  results are cached in SQLite on the `searxng-cache` volume.
+
+Routing these engines through the Tor proxy was evaluated and **rejected**: it
+buys nothing (none of them blocks this IP) and adds latency.
 
 ### Telegram Notify
 
@@ -323,8 +368,14 @@ Scope: speaker labels are **anonymous** (`S1`, `S2`, …) and consistent within 
 ├── onionclaw-data/          # SICRY SQLite DB (git-ignored)
 ├── chroma-data/             # ChromaDB persistence (git-ignored)
 ├── chroma-cache/            # ChromaDB/HNSW cache (git-ignored)
+├── websearch/
+│   ├── server.cjs           # MCP stdio entrypoint (JSON-RPC by hand)
+│   ├── search.cjs           # Lane order, cache, circuit breaker, timeouts
+│   ├── browser.cjs          # Shared Chromium + DuckDuckGo/Bing/Marginalia extractors
+│   └── Dockerfile           # Builds websearch-mcp:latest on mcp/playwright
+├── websearch-data/          # Query cache + breaker state (git-ignored)
 ├── searxng/
-│   └── settings.yml         # SearXNG settings
+│   └── settings.yml         # SearXNG settings (keyless engine set = L5)
 ├── session-proxy/
 │   ├── proxy.py             # Session-healing MCP reverse proxy
 │   └── README.md            # Proxy design details
