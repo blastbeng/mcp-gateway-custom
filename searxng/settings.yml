@@ -68,14 +68,22 @@ engines:
   - name: mdn
     disabled: false
 
+  # The three package registries ship in the `it` category, so every
+  # general/it query came back larded with unrelated crates and packages
+  # (measured: 3 of 6 results for a docker query were crates.io). Pinned to
+  # `packages` they stay reachable with a bang (!npm, !pypi, !crates) without
+  # polluting an ordinary search.
   - name: pypi
     disabled: false
+    categories: [packages]
 
   - name: npm
     disabled: false
+    categories: [packages]
 
   - name: crates.io
     disabled: false
+    categories: [packages]
 
   - name: arxiv
     disabled: false

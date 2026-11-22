@@ -166,7 +166,7 @@ Lanes run **in order**, merging until `count` results are collected (so a
 | `duckduckgo` | headless Chromium on `html.duckduckgo.com/html/` | the strongest keyless SERP from this host. Plain HTTP clients get HTTP 202 + an anomaly page; a real browser gets a normal list (`result__a` / `result__snippet`) in ~1-2 s with ten on-topic results. Paced (`DDG_MIN_INTERVAL_S`, 3 s) and budgeted (`DDG_MAX_PER_HOUR`, 150) because it is still somebody else's endpoint |
 | `bing` | headless Chromium on `bing.com/search?form=QBLH` | second opinion with broader coverage: `form=QBLH` is the only Bing variant that is not degraded (over plain HTTP Bing honours just the first keyword, and `format=rss` returns unrelated results). **This IP gets throttled**: after a handful of queries Bing answers "There are no results for ..." (`li.b_no`), so the lane is paced (`BING_MIN_INTERVAL_S`, 8 s), budgeted (`BING_MAX_PER_HOUR`, 40) and three empty SERPs trip its breaker |
 | `marginalia` | headless Chromium on `marginalia-search.com` | independent index (small/curated web), no key, ~2 s JS bot gate |
-| `searxng` | local SearXNG JSON API | the L5 fallback, `categories=general,it,science` (see below) |
+| `searxng` | local SearXNG JSON API | the L5 fallback, `categories=general,it` (see below) |
 | `wikipedia`, `stackexchange`, `hn` | official JSON APIs | keyless tail that cannot be bot-blocked; always answers |
 
 Behaviour that makes it usable from an agent loop:
@@ -216,11 +216,16 @@ Two details worth knowing:
 
 - SearXNG's default category is `general` only, which on this engine set means
   `mwmbl` + `wiby`. The engine mix is spread over `it` (github, mdn,
-  stackoverflow, ...) and `science` (arxiv, openalex, crossref), so callers
-  should ask for `categories=general,it,science` — `websearch` does
-  (measured on the query `python asyncio timeout`: 85 results from 2 engines
-  with the default category, 191 from 10 engines with all three, zero
-  unresponsive).
+  stackoverflow, hackernews) and `science` (arxiv, openalex, crossref), so
+  callers should ask for `categories=general,it` — `websearch` does. `science`
+  is opt-in: measured on `docker compose healthcheck interval`, adding it
+  contributed 39 marginally relevant papers that pushed the real hits off the
+  page (23 results with `general,it`, 62 with `science` added).
+- The package registries (`npm`, `pypi`, `crates.io`) ship in the `it`
+  category, so every technical query came back larded with unrelated crates
+  (3 of 6 results in one test). `searxng/settings.yml` pins their category to
+  `packages`: they stay reachable with a bang (`!npm react`) but no longer
+  pollute a plain search.
 - The `valkey` container backs only the limiter/botdetection, which is disabled;
   results are cached in SQLite on the `searxng-cache` volume.
 

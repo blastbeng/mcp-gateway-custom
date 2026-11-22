@@ -36,7 +36,13 @@ function envInt(name, fallback) {
 }
 
 const SEARXNG_URL = (process.env.SEARXNG_URL || 'http://searxng:8080').replace(/\/+$/, '');
-const SEARXNG_CATEGORIES = process.env.SEARXNG_CATEGORIES || 'general,it,science';
+// SearXNG's default category is `general` only, which on the keyless engine set
+// (see searxng/settings.yml) means mwmbl + wiby and nothing else. `it` adds
+// github/mdn/stackoverflow/hackernews. `science` (arxiv, openalex, crossref) is
+// deliberately NOT in the default: measured on a docker query it contributed 39
+// loosely-matching papers, which pushed the real hits off the page. Ask for it
+// explicitly with the standalone searxng tool when the query is academic.
+const SEARXNG_CATEGORIES = process.env.SEARXNG_CATEGORIES || 'general,it';
 const LANE_TIMEOUT_MS = envInt('LANE_TIMEOUT_MS', 20000);
 const TOTAL_TIMEOUT_MS = envInt('TOTAL_TIMEOUT_MS', 45000);
 const CACHE_TTL_S = envInt('CACHE_TTL_S', 86400);
@@ -401,22 +407,27 @@ async function laneSearxng({ query, count, freshness, timeoutMs }) {
   url.searchParams.set('format', 'json');
   url.searchParams.set('language', 'en');
   url.searchParams.set('safesearch', '1');
-  // SearXNG's default category is `general` only, which on the keyless engine
-  // set (see searxng/settings.yml) means mwmbl + wiby and nothing else:
-  // github/mdn/stackoverflow live in `it`, arxiv/openalex/crossref in
-  // `science`. Asking for all three is what makes the fallback return a mixed,
-  // useful page (measured: 85 -> 191 results, zero unresponsive engines).
   url.searchParams.set('categories', SEARXNG_CATEGORIES);
   if (freshness) url.searchParams.set('time_range', freshness);
 
   const data = await fetchJson(url, timeoutMs);
   const results = Array.isArray(data?.results) ? data.results : [];
-  return results.slice(0, count).map((item) => ({
-    title: stripTags(item.title),
-    url: item.url,
-    snippet: clip(stripTags(item.content || item.publishedDate || ''), 400),
-    engine: `searxng:${item.engine || 'unknown'}`,
-  }));
+  // mwmbl/wiby are the only general-web indexes left in this instance; the rest
+  // are site APIs (github, mdn, stackoverflow) whose own ranking can put a
+  // loosely-matching page first (e.g. "Window.setInterval" for a docker query).
+  // A web search wants the general index hits on top, so lift them without
+  // disturbing the relative order inside each group.
+  const generalFirst = (item) => (/^(mwmbl|wiby)$/.test(item.engine || '') ? 0 : 1);
+  return results
+    .slice()
+    .sort((a, b) => generalFirst(a) - generalFirst(b))
+    .slice(0, count)
+    .map((item) => ({
+      title: stripTags(item.title),
+      url: item.url,
+      snippet: clip(stripTags(item.content || item.publishedDate || ''), 400),
+      engine: `searxng:${item.engine || 'unknown'}`,
+    }));
 }
 
 async function laneWikipedia({ query, count, timeoutMs }) {

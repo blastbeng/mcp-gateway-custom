@@ -50,9 +50,12 @@ registry:
         value: "http://searxng:8080"
 
       # SearXNG's default category is `general` only; the keyless engine set is
-      # spread over `it` and `science` (github/mdn/stackoverflow, arxiv/...).
+      # spread over `general` (mwmbl, wiby), `it` (github, mdn, stackoverflow,
+      # hackernews) and `science` (arxiv, openalex, crossref). `science` is left
+      # out on purpose: on a technical query it added ~39 marginally relevant
+      # papers that pushed the real hits down. Add it for academic queries.
       - name: SEARXNG_CATEGORIES
-        value: "general,it,science"
+        value: "general,it"
 
       # Survives gateway restarts and idle-child reaping: the cache and the
       # breaker state are worth more than one process lifetime.
