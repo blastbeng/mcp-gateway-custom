@@ -8,11 +8,11 @@ An MCP server advertises every tool it owns in `tools/list`, and the client
 re-sends that list to the model on EVERY turn, at the top of the prompt (the
 tools block renders inside the system area of the chat template).
 
-This stack advertises 126 tools from the docker-mcp gateway (109) plus Home
-Assistant (17): ~107k characters of JSON schema, i.e. 33k-47k tokens. On a
-cloud model that is a cost. On the cheap LLM node (Orange Pi Zero 3W: 12.288
-tokens of context, 20-35 tok/s of prefill) it is impossible - the 47k-token
-prompt needs ~40 minutes to prefill and does not fit at all.
+This stack advertises 109 tools from the docker-mcp gateway. Measured on this
+surface: ~107k characters of JSON schema, i.e. 33k-47k tokens. On a cloud
+model that is a cost. On the cheap LLM node (Orange Pi Zero 3W: 12.288 tokens
+of context, 20-35 tok/s of prefill) it is impossible - a 40k-token prompt
+needs ~35 minutes to prefill and does not fit at all.
 
 Two further constraints make "just prune the list per request" useless:
 
@@ -33,8 +33,17 @@ So this proxy replaces the whole surface with two tools that never change:
       Executes any tool from the catalogue on its upstream server and relays
       the result verbatim (text, images, structured content - untouched).
 
-Result: ~250 tokens instead of ~33k, all 126 tools remain reachable, and no
+Result: ~250 tokens instead of ~33k, all 109 tools remain reachable, and no
 client needs to change: this is just another MCP server.
+
+The model cannot see the catalogue, so it cannot know what to search for. The
+`tools_search` description therefore carries a CAPABILITY MAP: the domains
+behind the proxy with the tool-name patterns of each, built from the live
+catalogue and capped (`MCP_LITE_MAP_CHARS`). A domain label is curated
+(`chroma_*` is semantic memory - the tool names do not say so); a tool no
+label claims is listed under "other" by name, so a server added to the gateway
+appears in the map without touching this file. A few hundred characters, and
+the map changes only when the catalogue changes.
 
 Deliberately stdlib only (no `mcp` SDK): it must start in a 128 MB python
 container and never depend on PyPI at boot.
@@ -46,8 +55,8 @@ either `token` or `token_env` (read from the environment):
 
   [{"name":"gateway","url":"http://mcp-gateway:8811/mcp",
     "token_env":"MCP_GATEWAY_AUTH_TOKEN"},
-   {"name":"homeassistant","url":"http://host.docker.internal:8123/api/mcp",
-    "token_env":"MCP_LITE_HA_TOKEN"}]
+   {"name":"other","url":"http://host.docker.internal:9000/mcp",
+    "token_env":"MCP_LITE_OTHER_TOKEN"}]
 
 The proxy owns ONE streamable-HTTP session per upstream, heals it on
 "session not found", and releases it after MCP_LITE_IDLE_TTL seconds without
@@ -66,6 +75,7 @@ If the embedding endpoint is unreachable the proxy keeps working with a
 lexical (IDF-weighted) scorer, so a down node degrades recall, never service.
 """
 
+import fnmatch
 import hashlib
 import hmac
 import json
@@ -193,9 +203,9 @@ class Upstream:
 
         Two shapes are supported, because servers disagree: the docker-mcp
         gateway answers `initialize` with an Mcp-Session-Id header (stateful
-        streamable HTTP), Home Assistant answers 200 and no header (stateless).
-        A stateless upstream is usable without a session id; requiring one
-        silently dropped all 17 of its tools.
+        streamable HTTP); a stateless server answers 200 with no header. A
+        stateless upstream is usable without a session id; requiring one
+        silently drops every tool it owns.
         """
         with self.lock:
             if force and self.ready:
@@ -334,6 +344,231 @@ def _embed(texts):
 
 
 # --------------------------------------------------------------------------
+# capability map: what KIND of tools sit behind this proxy
+# --------------------------------------------------------------------------
+#
+# The model sees two meta-tools and no catalogue, so it has no idea what is
+# worth searching for. Naming the DOMAINS behind the proxy, with the tool-name
+# patterns of each, is what tells it "there is a browser here, a vector
+# memory, a web search". The map rides on the `tools_search` description and
+# on `initialize`, so it costs a few hundred characters per turn instead of
+# the 33k-47k tokens of the full surface.
+#
+# It is built FROM the live catalogue, not hard-coded, so it cannot rot:
+#
+#   * the labels are curated, because a human knows `chroma_*` is semantic
+#     memory while the tool names do not say so;
+#   * a domain that has no tools left drops out of the map (a removed server
+#     spends no tokens);
+#   * a tool no label claims is appended under "other", by name, so a server
+#     added to the gateway shows up in the map with no edit in this file;
+#   * the string is memoized on the catalogue digest, so it changes only when
+#     the catalogue changes: the tool surface stays constant inside a
+#     conversation, which is what keeps llama.cpp's prefix cache warm.
+#
+# `match` entries are fnmatch patterns over the tool name; `show` is the
+# compact text printed for the domain (default: its patterns), written when
+# the patterns are too many to spell out. `MCP_LITE_DOMAINS` (JSON list) is
+# matched BEFORE these defaults, so a deployment can re-label, split or shadow
+# a domain without touching the code.
+
+MAP_CHARS = int(os.environ.get("MCP_LITE_MAP_CHARS", "760"))
+OTHER_IN_MAP = int(os.environ.get("MCP_LITE_MAP_OTHER_NAMES", "8"))
+
+DEFAULT_DOMAINS = [
+    {"label": "browser automation (Playwright + Chrome DevTools)",
+     "match": ["browser_*",
+               "new_page", "navigate_page", "select_page", "list_pages", "close_page",
+               "resize_page", "emulate", "click", "hover", "drag", "fill", "fill_form",
+               "type_text", "press_key", "upload_file", "handle_dialog", "wait_for",
+               "evaluate_script", "set_logpoints", "take_snapshot", "take_screenshot",
+               "take_heapsnapshot", "list_console_messages", "get_console_message",
+               "list_network_requests", "get_network_request", "get_css_styles",
+               "performance_start_trace", "performance_stop_trace",
+               "performance_analyze_insight", "lighthouse_audit", "screencast_start",
+               "screencast_stop"],
+     "show": "browser_* / navigate_page, click, fill, take_screenshot, "
+             "console+network, traces, lighthouse_audit"},
+    {"label": "Tor / dark-web OSINT (SICRY)", "match": ["sicry_*"]},
+    {"label": "semantic long-term memory", "match": ["chroma_*"]},
+    {"label": "web search + page fetch, keyless",
+     "match": ["web_search", "web_search_status", "web_url_read", "searxng_*"],
+     "show": "web_search, web_url_read, searxng_*"},
+    {"label": "model council (other LLMs)",
+     "match": ["ask", "ask_all", "list_council", "probe_models", "revise",
+               "revision_prompt"],
+     "show": "ask, ask_all, list_council, probe_models, revise*"},
+    {"label": "Telegram notify (one fixed bot+chat)",
+     "match": ["send_message", "send_document", "send_photo", "send_video",
+               "send_audio", "get_updates"],
+     "show": "send_*, get_updates"},
+    {"label": "media ingest + transcription", "match": ["klaket_*"]},
+    {"label": "library docs", "match": ["resolve-library-id", "query-docs"]},
+    {"label": "image analysis", "match": ["read_image"]},
+]
+
+
+def _load_domains():
+    doms = [d for d in DEFAULT_DOMAINS if d.get("match")]
+    raw = os.environ.get("MCP_LITE_DOMAINS", "").strip()
+    if raw:
+        try:
+            extra = json.loads(raw)
+            if isinstance(extra, dict):
+                extra = [extra]
+            extra = [d for d in extra if isinstance(d, dict) and d.get("match")]
+            doms = extra + doms          # first claim wins: env shadows a default
+        except Exception as e:
+            log("MCP_LITE_DOMAINS is not valid JSON (%s); using the defaults" % e)
+    return doms
+
+
+DOMAINS = _load_domains()
+
+
+def _show_of(dom, shown):
+    """The patterns to print for a domain.
+
+    Spelled out while there are few, summarized by `show` when the domain is
+    built from patterns too many to list. Only patterns that matched are
+    printed, so a domain that shrinks stops advertising tools it no longer
+    has: the map follows the catalogue, not this file.
+    """
+    if len(shown) <= 3:
+        return ", ".join(shown)
+    return dom.get("show") or ("%s, +%d more" % (shown[0], len(shown) - 1))
+
+
+def _compact_show(text):
+    """The first two patterns, for when the budget is tight.
+
+    Used only to make room: naming a server nobody has labelled yet matters
+    more than spelling out a domain the model can infer from one pattern.
+    """
+    text = text.split(" / ")[0]
+    return ", ".join([t.strip() for t in text.split(", ")][:2])
+
+
+def _domain_part(dom, names, compact=False):
+    """-> ('label (patterns) (n)', {claimed tools}) or (None, set()).
+
+    The count is printed only when it says something: one tool is not a crowd.
+    """
+    hits, shown = set(), []
+    for pat in dom.get("match") or []:
+        got = {n for n in names if fnmatch.fnmatch(n, pat)}
+        if got:
+            hits |= got
+            shown.append(pat)
+    if not hits:
+        return None, set()
+    text = _show_of(dom, shown)
+    n = len(hits)
+    if compact:
+        text = _compact_show(text)
+    label = dom["label"].split(" (")[0] if compact else dom["label"]
+    return "%s (%s)%s" % (label, text, " (%d)" % n if n > 1 else ""), hits
+
+
+def _prefix_of(name):
+    """`chroma_add_documents` -> `chroma`, `query-docs` -> `query`."""
+    for sep in ("__", "_", "-"):
+        if sep in name:
+            return name.split(sep, 1)[0]
+    return name
+
+
+def _rest_tokens(rest):
+    """Unlabelled tools, grouped by name prefix: `foo_*`, `bar_a/baz_b`.
+
+    This is what keeps the map honest with no rebuild: a server nobody has
+    labelled yet arrives with its own prefix, shows up here under that prefix,
+    and needs no code edit. Only the label is curated, never the membership.
+    """
+    groups = {}
+    for n in rest:
+        groups.setdefault(_prefix_of(n), set()).add(n)
+    out = []
+    for p, members in sorted(groups.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+        out.append(("%s_*" % p) if len(members) >= 3 else "/".join(sorted(members)))
+    return out
+
+
+_TRUNC = "…"
+_UNLABELLED = "unlabelled"
+
+
+def _render_map(names, servers, compact, budget):
+    """The map as one string. `compact` shortens labels/patterns to make room.
+
+    First claim wins: a domain takes the tools it matches and the rest see
+    only what is left, so a tool is counted once and an entry in
+    MCP_LITE_DOMAINS really does shadow the default it overlaps.
+    """
+    parts, claimed, pool = [], set(), set(names)
+    for dom in DOMAINS:
+        part, hits = _domain_part(dom, sorted(pool), compact)
+        if part:
+            parts.append((len(hits), part))
+            claimed |= hits
+            pool -= hits
+    head = "%d tools from %s: " % (len(names), ", ".join(servers)) if len(servers) > 1 \
+        else "%d tools: " % len(names)
+    parts.sort(key=lambda p: -p[0])
+    rest = sorted(n for n in names if n not in claimed)
+    out, used = [], len(head)
+    for _, part in parts:
+        if used + len(part) + 3 > budget:
+            out.append(_TRUNC)
+            break
+        out.append(part)
+        used += len(part) + 3
+    if rest:
+        tokens = _rest_tokens(rest)
+        tail = "other (%d): %s" % (len(rest), ", ".join(tokens[:OTHER_IN_MAP]))
+        if len(tokens) > OTHER_IN_MAP:
+            tail += ", +%d more" % (len(tokens) - OTHER_IN_MAP)
+        # An unlabelled server is never silently dropped: when its names do not
+        # fit, its count is printed, which is enough to prompt a search.
+        for cand in (tail, "other (%d %s)" % (len(rest), _UNLABELLED)):
+            if used + len(cand) + 3 <= budget:
+                if out and out[-1] == _TRUNC:
+                    out[-1] = cand
+                else:
+                    out.append(cand)
+                break
+    return head + " · ".join(out)
+
+
+def build_map(tools, budget=MAP_CHARS):
+    """One line: '109 tools: web search + page fetch, keyless (...) (6) · ...'
+
+    Built from the catalogue whenever its digest changes, so a tool, a gateway
+    server, an upstream, an MCP server inside the gateway added or removed
+    updates the map by itself: no rebuild, no redeploy, no edit in this file.
+    The biggest domains render first, so the budget cut costs the least of the
+    surface; tools no label claims are named by prefix at the end, and when
+    they do not fit the map is re-rendered in a compact form that makes room
+    for them, because naming an unlabelled server is the point of the map.
+    """
+    names = [t["name"] for t in tools]
+    if not names:
+        return "the catalogue is empty; it is built on boot, search anyway"
+    servers = sorted({t["server"] for t in tools})
+    full = _render_map(names, servers, False, budget)
+    # A compact render wins only when it fixes something: naming every domain,
+    # or naming an unlabelled server, beats spelling one domain out in detail
+    # and cutting the rest.
+    unlabelled, truncated = _UNLABELLED in full, _TRUNC in full
+    if unlabelled or truncated:
+        compact = _render_map(names, servers, True, budget)
+        if (unlabelled and _UNLABELLED not in compact) \
+                or (truncated and _TRUNC not in compact):
+            return compact
+    return full
+
+
+# --------------------------------------------------------------------------
 # catalogue: tools from every upstream + semantic index
 # --------------------------------------------------------------------------
 
@@ -368,6 +603,26 @@ class Catalog:
         self._building = False
         self._build_lock = threading.Lock()
         self._digest = None
+        self._map = None
+        self._map_digest = "init"
+
+    # -- capability map ------------------------------------------------
+    def map_line(self):
+        """The one-line 'what is behind this proxy', memoized on the digest.
+
+        Memoizing is not an optimization here: the string rides on the tool
+        description, and a description that changes mid-conversation forces a
+        full re-prefill. It moves when the catalogue moves, and never
+        otherwise.
+        """
+        with self.lock:
+            digest, tools = self._digest, list(self.tools)
+        if digest == self._map_digest and self._map is not None:
+            return self._map
+        line = build_map(tools)
+        with self.lock:
+            self._map_digest, self._map = digest, line
+        return line
 
     # -- persistence ---------------------------------------------------
     def _load_cache(self, digest):
@@ -413,8 +668,8 @@ class Catalog:
         Idempotent by construction: the catalogue is DERIVED from what the
         upstreams answer right now, never accumulated. A tool added upstream
         (new `--servers` entry in the gateway, a new MCP server in the
-        catalogue, a new Home Assistant entity exposed by its MCP endpoint, a
-        new tool inside an existing server) shows up at the next refresh; one
+        catalogue, a new tool inside an existing server, a new entry in
+        MCP_LITE_UPSTREAMS) shows up at the next refresh; one
         that disappears drops out of the index and out of `by_name`, and
         `tool_call` starts answering "unknown tool" for it instead of hanging.
         No state to migrate, no restart, nothing to remember.
@@ -665,20 +920,23 @@ CATALOG = Catalog(UPSTREAMS)
 # --------------------------------------------------------------------------
 
 def meta_tools():
-    n = len(CATALOG.tools)
-    servers = sorted({t["server"] for t in CATALOG.tools})
-    where = ", ".join(servers) if servers else "the MCP backends"
-    count = ("%d tools are available (from: %s). " % (n, where)) if n else ""
+    """The whole tool surface: two tools, and they never change.
+
+    The only variable text is the capability map, which moves exactly when the
+    catalogue moves (`Catalog.map_line`) and is memoized so it cannot invalidate
+    the prefix cache between two turns of the same conversation.
+    """
     return [
         {
             "name": "tools_search",
             "description": (
-                "Search the MCP tool catalogue. " + count +
-                "Pass the task in natural language; returns the FULL JSON schema of the "
-                "k best matching tools plus the names of other close matches. ALWAYS call "
-                "this before acting: the schemas are not in the prompt, so you must not "
-                "guess a tool name or its arguments. Use names_only=true to browse the "
-                "whole catalogue by name."),
+                "Search the MCP tool catalogue. " + CATALOG.map_line() + ". Pass the task "
+                "in natural language; returns the FULL JSON schema of the k best matching "
+                "tools plus the names of other close matches. ALWAYS call this before "
+                "acting: the schemas are not in the prompt, so you must not guess a tool "
+                "name or its arguments. The list is the DOMAINS behind this proxy, not the "
+                "whole catalogue: search even when nothing there seems to fit. Use "
+                "names_only=true to browse the whole catalogue by name."),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -904,6 +1162,11 @@ class Handler(BaseHTTPRequestHandler):
                                   if CATALOG.checked_at else None),
                 "digest": (CATALOG._digest or "")[:12],
                 "servers": sorted({t["server"] for t in CATALOG.tools}),
+                # The exact text a client is being told about this catalogue, so
+                # the map can be checked (and its cost measured) without a
+                # client round trip. Memoized: it costs nothing here.
+                "map": CATALOG.map_line(),
+                "map_chars": len(CATALOG.map_line()),
                 "upstreams": [{"name": u.name, "session": bool(u.sid),
                                "stateless": u.stateless, "ready": u.ready}
                               for u in UPSTREAMS]}).encode()
@@ -912,7 +1175,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/refresh":
             # Idempotent admin op: re-read tools/list from every upstream and
             # rebuild the index if the catalogue changed. Safe to call anytime
-            # (deploy hook, after adding an MCP server, after an HA reload).
+            # (deploy hook, after adding an MCP server to the gateway).
             CATALOG._force()
             self._send(200, json.dumps({"ok": True,
                                         "tools": len(CATALOG.tools),
@@ -982,7 +1245,7 @@ class Handler(BaseHTTPRequestHandler):
                 "serverInfo": {"name": "mcp-tools-lite", "version": "1.0"},
                 "instructions": ("This server exposes the whole MCP catalogue behind two tools: "
                                  "tools_search and tool_call. Call tools_search with the task "
-                                 "before using any tool."),
+                                 "before using any tool. Behind it: " + CATALOG.map_line()),
             })
             return
 

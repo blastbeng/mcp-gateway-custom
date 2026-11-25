@@ -34,7 +34,7 @@ A self-hosted, Docker Compose-based stack that runs the [Docker MCP Gateway](htt
 |---|---|---|
 | `mcp-gateway` | `docker/mcp-gateway:latest` | Central MCP gateway (streamable-HTTP on port 8811, exposed as `127.0.0.1:8813`) |
 | `mcp-session-proxy` | `python:3.12-alpine` | Reverse proxy that heals MCP sessions: owns one upstream session, hands clients a **stable session id**, transparently re-initializes on upstream 404 (`session not found`), and after 15 min without traffic releases the upstream session so the gateway stops the idle `longLived` child containers (browsers included) — they cold-start again on the next call |
-| `mcp-tools-lite` | `python:3.12-alpine` | Fronts the whole catalogue (gateway **and** Home Assistant) with two constant meta-tools — `tools_search` (semantic, over the stack's `embedding-model`) and `tool_call` — so a model on a small CPU node does not have to prefill tens of thousands of tokens of tool schemas. Catalogue derived from the upstreams, self-refreshing, see [Tools-lite](#tools-lite-a-constant-tiny-tool-surface) |
+| `mcp-tools-lite` | `python:3.12-alpine` | Fronts the whole gateway catalogue with two constant meta-tools — `tools_search` (semantic, over the stack's `embedding-model`, with a **capability map** of what is behind the proxy in its description) and `tool_call` — so a model on a small CPU node does not have to prefill tens of thousands of tokens of tool schemas. Catalogue derived from the upstreams, self-refreshing, see [Tools-lite](#tools-lite-a-constant-tiny-tool-surface) |
 | `searxng` | `searxng/searxng:latest` | Metasearch engine restricted to keyless engines (`searxng/settings.yml`): the always-up fallback behind the `websearch` MCP |
 | `valkey` | `valkey/valkey:9-alpine` | Limiter/botdetection backend for SearXNG (disabled); search results are cached in SQLite on the `searxng-cache` volume |
 | `chroma` | `chromadb/chroma:latest` | ChromaDB vector store, used by the Chroma MCP server for persistent semantic memory |
@@ -62,9 +62,9 @@ see all servers at all times.
 semantic index, because the full surface is unusable from a small model on a
 small machine:
 
-- the gateway + Home Assistant expose **126 tools**; rendered into a chat
-  template that is tens of thousands of tokens (measured: 46,909 tokens for the
-  168 tools Open WebUI attached, ~107 KB of raw JSON schema);
+- the gateway exposes **109 tools**; rendered into a chat template that is tens
+  of thousands of tokens (measured: 46,909 tokens for the 168 tools Open WebUI
+  attached, ~107 KB of raw JSON schema);
 - prefill on the CPU-only node is **20–35 tok/s**, so that prompt is ~40 minutes
   of work before the first answer token;
 - the tools block is rendered at the **start** of the template, so *any* change
@@ -73,12 +73,55 @@ small machine:
   tool selection therefore does not help either: the surface must be small **and
   constant**.
 
-`tools/list` answers with exactly two tools (**1,332 chars, ~370 tokens**):
+`tools/list` answers with exactly two tools (**1,870 chars, ~467 tokens** on
+the 109-tool catalogue, capability map included; ~1,260 chars / ~315 tokens
+without it):
 
 | Tool | What it does |
 |---|---|
-| `tools_search(query, k=3, names_only=false)` | Semantic search over the catalogue with the stack's own `embedding-model`; returns the **full JSON schema** of the k best matches, the names of close matches, the catalogue size and the servers. `names_only=true` browses the whole catalogue by name (40 entries) |
+| `tools_search(query, k=3, names_only=false)` | Semantic search over the catalogue with the stack's own `embedding-model`; returns the **full JSON schema** of the k best matches, the names of close matches, the catalogue size and the servers. Its description also carries the **capability map** (below): the model would otherwise have no idea what is worth searching for. `names_only=true` browses the whole catalogue by name (40 entries) |
 | `tool_call(name, arguments)` | Executes any catalogue tool on its upstream and relays the result verbatim (text, images, structured content), including `isError` |
+
+#### Capability map: what kind of MCPs are behind the proxy
+
+The model sees two meta-tools and no catalogue, so it cannot know that a
+browser, a vector memory or a keyless web search exist. One line, built **from
+the live catalogue**, says so — in the `tools_search` description and in the
+`initialize` instructions:
+
+```
+109 tools: browser automation (Playwright + Chrome DevTools) (browser_* / navigate_page, click,
+fill, take_screenshot, console+network, traces, lighthouse_audit) (56) · Tor / dark-web OSINT
+(SICRY) (sicry_*) (15) · semantic long-term memory (chroma_*) (13) · web search + page fetch,
+keyless (web_search, web_url_read, searxng_*) (6) · model council (other LLMs) (ask, ask_all,
+list_council, probe_models, revise*) (6) · Telegram notify (one fixed bot+chat) (send_*,
+get_updates) (6) · media ingest + transcription (klaket_*) (4) · library docs
+(resolve-library-id, query-docs) (2) · image analysis (read_image)
+```
+
+**611 chars / ~152 tokens** (measured, `map_chars` in `/health`), against
+33k–47k for the whole surface: it costs ~150 tokens per turn and is the only
+part of the surface that is not a fixed string.
+
+Every rule keeps it true **without a rebuild** — it is derived on each catalogue
+change, exactly like the index:
+
+| Change in the stack | What the map does |
+|---|---|
+| a tool added/removed inside a server | its count follows; a domain with no tools left disappears from the line and spends no tokens |
+| a domain's patterns shrink | only patterns that still match are printed (`web_url_read` gone → no longer advertised) |
+| a server nobody has labelled | its tools land in `other (n): foo_*, bar_a/baz_b` — named by prefix, so they are searchable right away |
+| an upstream added/removed | the header `N tools from a, b` and the `other` bucket follow it |
+| catalogue unchanged | the string is memoized on the catalogue digest, byte-identical, so llama.cpp's prefix cache survives — a description that changes mid-conversation forces a full re-prefill |
+
+Only the **labels** are curated (`DEFAULT_DOMAINS` in `tools-lite/proxy.py`): a
+human knows `chroma_*` is semantic memory and the tool names do not say so.
+Membership is never curated. `MCP_LITE_DOMAINS` (JSON, matched **first**, so it
+shadows a default) re-labels, splits or extends a domain per deployment without
+touching the code; `MCP_LITE_MAP_CHARS` is the budget (760 by default) and, when
+the line does not fit, the map is re-rendered in a compact form that trades
+detail on the big domains for room to name the unlabelled ones. `/health`
+reports the exact line as `map` plus its length as `map_chars`.
 
 Measured on the Italian routing benchmark: **recall@8 15/18 (83%)** for the
 semantic index versus 9/18 (50%) for Open WebUI's BM25 tool search, 105–150 ms
@@ -88,8 +131,8 @@ then loaded from `/cache/index.json`.
 #### Idempotency: the catalogue follows the upstreams
 
 The catalogue is **derived**, never accumulated, so adding or removing an MCP
-server (or a tool inside one, or an entity in Home Assistant) needs no edit, no
-restart and no migration:
+server (a tool inside one, an upstream in `MCP_LITE_UPSTREAMS`, a whole stack)
+needs no edit, no restart and no migration:
 
 - every refresh reads `tools/list` from **all** upstreams (in parallel, bounded
   by `MCP_LITE_REFRESH_TIMEOUT`) and replaces the catalogue with what they
@@ -112,10 +155,10 @@ restart and no migration:
 `GET /health` reports the state used to verify all of the above:
 
 ```json
-{"ok":true,"tools":126,"semantic":true,"index_age_s":5,"checked_age_s":5,
- "digest":"a3f00f0d4593","servers":["gateway","homeassistant"],
- "upstreams":[{"name":"gateway","session":true,"stateless":false,"ready":true},
-              {"name":"homeassistant","session":false,"stateless":true,"ready":true}]}
+{"ok":true,"tools":109,"semantic":true,"index_age_s":236,"checked_age_s":285,
+ "digest":"33a84b7052ee","servers":["gateway"],
+ "map":"109 tools: browser automation (Playwright + Chrome DevTools)…","map_chars":611,
+ "upstreams":[{"name":"gateway","session":true,"stateless":false,"ready":true}]}
 ```
 
 #### Adding an upstream
@@ -123,14 +166,15 @@ restart and no migration:
 Append an entry to `MCP_LITE_UPSTREAMS` (JSON) in `docker-compose.yml`:
 
 ```json
-{"name":"homeassistant","url":"http://host.docker.internal:8123/api/mcp","token_env":"MCP_LITE_HA_TOKEN"}
+{"name":"other","url":"http://host.docker.internal:9000/mcp","token_env":"MCP_LITE_OTHER_TOKEN"}
 ```
 
 `token_env` names a variable in the proxy's own environment, so no secret is
 written in the compose file. Both **stateful** streamable-HTTP servers (the
-gateway returns an `Mcp-Session-Id`) and **stateless** ones (Home Assistant
-answers 200 with no session header) are supported. Clients that prefer the
-native surface keep using the session proxy on `:8811`; nothing changes for
+gateway returns an `Mcp-Session-Id`) and **stateless** ones (200 with no session
+header) are supported, and the new server's tools join the index and the
+capability map on the next refresh. Clients that prefer the native surface keep
+using the session proxy on `:8811`; nothing changes for
 them.
 
 #### Env
@@ -140,6 +184,9 @@ them.
 | `MCP_LITE_UPSTREAMS` | gateway only | JSON list of `{name,url,token_env}` |
 | `MCP_LITE_EMBED_URL` / `_MODEL` | none / `embedding-model` | OpenAI-compatible embeddings endpoint; empty means lexical only |
 | `MCP_LITE_TOP_K` | `3` | default `k` for `tools_search` |
+| `MCP_LITE_MAP_CHARS` | `760` | budget of the capability map inside the `tools_search` description |
+| `MCP_LITE_DOMAINS` | none | JSON list of `{label,match,show}` domains, matched before the built-in ones (shadows a default, labels an unlabelled server) |
+| `MCP_LITE_MAP_OTHER_NAMES` | `8` | how many unlabelled prefixes/names the map spells out |
 | `MCP_LITE_REFRESH_TTL` | `3600` | catalogue age that triggers a background refresh |
 | `MCP_LITE_REFRESH_TIMEOUT` | `45` | per-upstream `tools/list` budget |
 | `MCP_LITE_REFRESH_MIN_GAP` | `30` | minimum gap between two stale checks |

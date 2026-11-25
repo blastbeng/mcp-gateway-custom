@@ -576,13 +576,13 @@ services:
   # 9/18 for Open WebUI's BM25 tool search), `tool_call` executes any tool on
   # its upstream and relays the result verbatim (images included).
   #
-  # It aggregates the gateway AND Home Assistant, so one connection covers
-  # everything. Clients that want the native surface keep using the session
-  # proxy on :8811; nothing changes for them.
+  # Its `MCP_LITE_UPSTREAMS` list decides what one client connection covers;
+  # today that is the whole gateway (109 tools). Clients that want the native
+  # surface keep using the session proxy on :8811; nothing changes for them.
   mcp-tools-lite:
     image: python:3.12-alpine
     container_name: mcp-tools-lite
-    # The index is 126 x 1024 floats plus the catalogue: ~20 MB of Python.
+    # The index is 109 x 1024 floats plus the catalogue: ~20 MB of Python.
     mem_limit: 192m
     restart: unless-stopped
     command:
@@ -598,10 +598,8 @@ services:
       # `token_env` names are resolved by the proxy from its own environment:
       # no secret is written in this file.
       MCP_LITE_UPSTREAMS: >-
-        [{"name":"gateway","url":"http://mcp-gateway:8811/mcp","token_env":"MCP_GATEWAY_AUTH_TOKEN"},
-        {"name":"homeassistant","url":"http://host.docker.internal:8123/api/mcp","token_env":"MCP_LITE_HA_TOKEN"}]
+        [{"name":"gateway","url":"http://mcp-gateway:8811/mcp","token_env":"MCP_GATEWAY_AUTH_TOKEN"}]
       MCP_GATEWAY_AUTH_TOKEN: ${MCP_GATEWAY_AUTH_TOKEN}
-      MCP_LITE_HA_TOKEN: ${MCP_LITE_HA_TOKEN}
       # Front-door token: the same bearer the clients already send to the
       # gateway, so switching a client to :8814 needs no new credential.
       # /health stays open (container healthcheck); empty = no authentication.
