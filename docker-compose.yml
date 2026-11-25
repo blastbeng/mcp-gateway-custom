@@ -555,6 +555,95 @@ services:
       - mcp-gateway
     networks:
       - mcp
+
+  # Tool surface reducer: TWO constant meta-tools (`tools_search`, `tool_call`)
+  # in front of every MCP server this stack runs.
+  #
+  # Why: an MCP server advertises every tool it owns, and the client re-sends
+  # the whole list to the model on EVERY turn, at the top of the prompt. This
+  # stack is 126 tools / ~107k chars of JSON schema = 33k-47k tokens. On the
+  # cheap LLM node (Orange Pi Zero 3W, 12.288 ctx, 20-35 tok/s prefill) that is
+  # not a cost, it is an impossibility: measured, a 47k-token prompt needs ~40
+  # minutes to prefill. And because the tools block sits at the START of the
+  # prompt, pruning it per request invalidates llama.cpp's prefix cache and the
+  # conversation is re-prefilled from zero - so the surface must be SMALL *and
+  # CONSTANT*, which rules out tool-RAG inside litellm as well.
+  #
+  # Two meta-tools (~250 tokens) cost 2 extra turns per task and keep every
+  # tool reachable: `tools_search` returns the full JSON schema of the k best
+  # matches from a semantic index built with the stack's own `embedding-model`
+  # (measured recall@8 15/18 on an Italian benchmark, 108 ms per query, versus
+  # 9/18 for Open WebUI's BM25 tool search), `tool_call` executes any tool on
+  # its upstream and relays the result verbatim (images included).
+  #
+  # It aggregates the gateway AND Home Assistant, so one connection covers
+  # everything. Clients that want the native surface keep using the session
+  # proxy on :8811; nothing changes for them.
+  mcp-tools-lite:
+    image: python:3.12-alpine
+    container_name: mcp-tools-lite
+    # The index is 126 x 1024 floats plus the catalogue: ~20 MB of Python.
+    mem_limit: 192m
+    restart: unless-stopped
+    command:
+      - python3
+      - -u
+      - /srv/proxy.py
+    volumes:
+      - ./tools-lite/proxy.py:/srv/proxy.py:ro
+      # Index cache: rebuilding it costs ~100 s of the cheap node's CPU, so it
+      # survives restarts and is redone only when the catalogue changes.
+      - ./tools-lite/cache:/cache:rw
+    environment:
+      # `token_env` names are resolved by the proxy from its own environment:
+      # no secret is written in this file.
+      MCP_LITE_UPSTREAMS: >-
+        [{"name":"gateway","url":"http://mcp-gateway:8811/mcp","token_env":"MCP_GATEWAY_AUTH_TOKEN"},
+        {"name":"homeassistant","url":"http://host.docker.internal:8123/api/mcp","token_env":"MCP_LITE_HA_TOKEN"}]
+      MCP_GATEWAY_AUTH_TOKEN: ${MCP_GATEWAY_AUTH_TOKEN}
+      MCP_LITE_HA_TOKEN: ${MCP_LITE_HA_TOKEN}
+      # Front-door token: the same bearer the clients already send to the
+      # gateway, so switching a client to :8814 needs no new credential.
+      # /health stays open (container healthcheck); empty = no authentication.
+      MCP_LITE_AUTH_TOKEN: ${MCP_GATEWAY_AUTH_TOKEN}
+      # The cheap node's Qwen3-Embedding-0.6B (llama-swap, alias
+      # embedding-model). If it is down the proxy falls back to a lexical
+      # scorer: recall drops, availability does not.
+      MCP_LITE_EMBED_URL: ${MCP_LITE_EMBED_URL:-http://192.168.1.142:10001/v1/embeddings}
+      MCP_LITE_EMBED_MODEL: embedding-model
+      MCP_LITE_CACHE: /cache/index.json
+      MCP_LITE_TOP_K: "3"
+      MCP_LITE_REFRESH_TTL: "3600"
+      # A refresh reads tools/list from every upstream in parallel; a hung MCP
+      # server costs this much and then keeps its previous tools, so it can
+      # never stall the proxy.
+      MCP_LITE_REFRESH_TIMEOUT: "45"
+      # Minimum gap between two stale checks (a search asks for a refresh).
+      MCP_LITE_REFRESH_MIN_GAP: "30"
+      # Same contract as the session proxy: after 15 min without client traffic
+      # the upstream sessions are released, so the gateway stops the long-lived
+      # child containers (Chromium, ...) it keeps per session.
+      MCP_LITE_IDLE_TTL: "900"
+    ports:
+      - "8814:8814"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - |
+          import urllib.request, sys
+          sys.exit(0 if urllib.request.urlopen("http://127.0.0.1:8814/health", timeout=5).status == 200 else 1)
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    depends_on:
+      - mcp-gateway
+    networks:
+      - mcp
 volumes:
 
   searxng-cache:

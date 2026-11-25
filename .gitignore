@@ -19,6 +19,8 @@ websearch-data/
 # Klaket job artifacts + downloaded models (whisper, sherpa-onnx, OCR)
 klaket-data/
 klaket-models/
+# tools-lite semantic index cache (rebuilt from the catalogue, ~100 s)
+tools-lite/cache/
 *.db
 *.sqlite3
 

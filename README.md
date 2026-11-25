@@ -34,6 +34,7 @@ A self-hosted, Docker Compose-based stack that runs the [Docker MCP Gateway](htt
 |---|---|---|
 | `mcp-gateway` | `docker/mcp-gateway:latest` | Central MCP gateway (streamable-HTTP on port 8811, exposed as `127.0.0.1:8813`) |
 | `mcp-session-proxy` | `python:3.12-alpine` | Reverse proxy that heals MCP sessions: owns one upstream session, hands clients a **stable session id**, transparently re-initializes on upstream 404 (`session not found`), and after 15 min without traffic releases the upstream session so the gateway stops the idle `longLived` child containers (browsers included) — they cold-start again on the next call |
+| `mcp-tools-lite` | `python:3.12-alpine` | Fronts the whole catalogue (gateway **and** Home Assistant) with two constant meta-tools — `tools_search` (semantic, over the stack's `embedding-model`) and `tool_call` — so a model on a small CPU node does not have to prefill tens of thousands of tokens of tool schemas. Catalogue derived from the upstreams, self-refreshing, see [Tools-lite](#tools-lite-a-constant-tiny-tool-surface) |
 | `searxng` | `searxng/searxng:latest` | Metasearch engine restricted to keyless engines (`searxng/settings.yml`): the always-up fallback behind the `websearch` MCP |
 | `valkey` | `valkey/valkey:9-alpine` | Limiter/botdetection backend for SearXNG (disabled); search results are cached in SQLite on the `searxng-cache` volume |
 | `chroma` | `chromadb/chroma:latest` | ChromaDB vector store, used by the Chroma MCP server for persistent semantic memory |
@@ -54,6 +55,102 @@ tool call re-initializes and starts only the container it needs. See
 [`session-proxy/README.md`](session-proxy/README.md#idle-release-why-ram-is-not-pinned).
 While a server is idle its tool list still comes from the catalog, so clients
 see all servers at all times.
+
+### Tools-lite: a constant, tiny tool surface
+
+`mcp-tools-lite` fronts the whole catalogue with **two** meta-tools and a
+semantic index, because the full surface is unusable from a small model on a
+small machine:
+
+- the gateway + Home Assistant expose **126 tools**; rendered into a chat
+  template that is tens of thousands of tokens (measured: 46,909 tokens for the
+  168 tools Open WebUI attached, ~107 KB of raw JSON schema);
+- prefill on the CPU-only node is **20–35 tok/s**, so that prompt is ~40 minutes
+  of work before the first answer token;
+- the tools block is rendered at the **start** of the template, so *any* change
+  to it invalidates llama.cpp's prefix cache and forces a full re-prefill
+  (measured: an identical 8,690-token prompt re-prefilled in 617 s). Per-request
+  tool selection therefore does not help either: the surface must be small **and
+  constant**.
+
+`tools/list` answers with exactly two tools (**1,332 chars, ~370 tokens**):
+
+| Tool | What it does |
+|---|---|
+| `tools_search(query, k=3, names_only=false)` | Semantic search over the catalogue with the stack's own `embedding-model`; returns the **full JSON schema** of the k best matches, the names of close matches, the catalogue size and the servers. `names_only=true` browses the whole catalogue by name (40 entries) |
+| `tool_call(name, arguments)` | Executes any catalogue tool on its upstream and relays the result verbatim (text, images, structured content), including `isError` |
+
+Measured on the Italian routing benchmark: **recall@8 15/18 (83%)** for the
+semantic index versus 9/18 (50%) for Open WebUI's BM25 tool search, 105–150 ms
+per query (query embedding included), index build 126 tools in ~100 s once,
+then loaded from `/cache/index.json`.
+
+#### Idempotency: the catalogue follows the upstreams
+
+The catalogue is **derived**, never accumulated, so adding or removing an MCP
+server (or a tool inside one, or an entity in Home Assistant) needs no edit, no
+restart and no migration:
+
+- every refresh reads `tools/list` from **all** upstreams (in parallel, bounded
+  by `MCP_LITE_REFRESH_TIMEOUT`) and replaces the catalogue with what they
+  answer *now*; a tool that disappears drops out of the index and out of
+  `by_name`, and `tool_call` on it answers `unknown tool ... closest names: ...`
+  instead of hanging;
+- a refresh is triggered by a client `tools/list`, by `tools_search` when the
+  catalogue is older than `MCP_LITE_REFRESH_TTL` (always in the background: a
+  search is never delayed by it), by the **catalogue watcher** every
+  `min(600, TTL/4)` seconds while a session is open (this is what makes a
+  removed server disappear on its own), and by `GET /refresh` (deploy hook);
+- a digest of *(name, description, server)* decides whether the index must be
+  rebuilt: an unchanged catalogue costs one `tools/list` and nothing else (no
+  re-embedding, no cache write);
+- an upstream that **fails** keeps its previous tools, so a transient gateway
+  restart cannot empty a third of the catalogue;
+- with the embeddings unreachable the index is built lexically and rebuilt
+  semantically as soon as they return.
+
+`GET /health` reports the state used to verify all of the above:
+
+```json
+{"ok":true,"tools":126,"semantic":true,"index_age_s":5,"checked_age_s":5,
+ "digest":"a3f00f0d4593","servers":["gateway","homeassistant"],
+ "upstreams":[{"name":"gateway","session":true,"stateless":false,"ready":true},
+              {"name":"homeassistant","session":false,"stateless":true,"ready":true}]}
+```
+
+#### Adding an upstream
+
+Append an entry to `MCP_LITE_UPSTREAMS` (JSON) in `docker-compose.yml`:
+
+```json
+{"name":"homeassistant","url":"http://host.docker.internal:8123/api/mcp","token_env":"MCP_LITE_HA_TOKEN"}
+```
+
+`token_env` names a variable in the proxy's own environment, so no secret is
+written in the compose file. Both **stateful** streamable-HTTP servers (the
+gateway returns an `Mcp-Session-Id`) and **stateless** ones (Home Assistant
+answers 200 with no session header) are supported. Clients that prefer the
+native surface keep using the session proxy on `:8811`; nothing changes for
+them.
+
+#### Env
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MCP_LITE_UPSTREAMS` | gateway only | JSON list of `{name,url,token_env}` |
+| `MCP_LITE_EMBED_URL` / `_MODEL` | none / `embedding-model` | OpenAI-compatible embeddings endpoint; empty means lexical only |
+| `MCP_LITE_TOP_K` | `3` | default `k` for `tools_search` |
+| `MCP_LITE_REFRESH_TTL` | `3600` | catalogue age that triggers a background refresh |
+| `MCP_LITE_REFRESH_TIMEOUT` | `45` | per-upstream `tools/list` budget |
+| `MCP_LITE_REFRESH_MIN_GAP` | `30` | minimum gap between two stale checks |
+| `MCP_LITE_AUTH_TOKEN` | gateway token | bearer required on `/mcp` and `/refresh`; `/health` is always open |
+| `MCP_LITE_CACHE` | `/cache/index.json` | index cache (survives restarts) |
+| `MCP_LITE_IDLE_TTL` | `900` | release upstream sessions after this many idle seconds |
+| `MCP_LITE_CALL_TIMEOUT` | `900` | budget of one real tool call |
+
+`manage-docker` restarts the service on its own when `tools-lite/proxy.py` is
+newer than the running container (the image is a plain `python:3.12-alpine`, so
+no pull or digest change would ever catch it).
 
 ### MCP servers registered in the gateway
 
@@ -384,6 +481,9 @@ Scope: speaker labels are **anonymous** (`S1`, `S2`, …) and consistent within 
 ├── session-proxy/
 │   ├── proxy.py             # Session-healing MCP reverse proxy
 │   └── README.md            # Proxy design details
+├── tools-lite/
+│   ├── proxy.py             # Two-meta-tool front over the whole catalogue (semantic index)
+│   └── cache/               # Index cache: tools + vectors (git-ignored)
 ├── telegram-notify/
 │   └── Dockerfile           # Builds telegram-notify-mcp:latest
 ├── local-image-reader/
@@ -429,6 +529,7 @@ docker compose up -d
 | Endpoint | URL | Purpose |
 |---|---|---|
 | Session proxy (recommended for clients) | `http://<host>:8811/mcp` or `:8812/mcp` | Stable MCP session id, auto-healing on 404 |
+| Tools-lite (small/cheap models) | `http://<host>:8814/mcp` | Two meta-tools over the whole catalogue; `/health` and `/refresh` (admin, idempotent) on the same port |
 | Gateway (direct) | `http://127.0.0.1:8813/mcp` | Direct gateway access (host-local only) |
 | SearXNG UI | `http://127.0.0.1:8080` | Metasearch web UI |
 | ChromaDB | `http://<host>:8000` | Vector store API |
@@ -442,6 +543,13 @@ docker run -i --rm mcp/inspector \
 ```
 
 Or point any MCP client (Claude Desktop, AiderDesk, etc.) at `http://<host>:8812/mcp` with the `Authorization: Bearer <MCP_GATEWAY_AUTH_TOKEN>` header.
+
+Clients backed by small models — Open WebUI on the cheap LLM node, a local
+AiderDesk with the gateway attached — should use `http://<host>:8814/mcp`:
+same catalogue, two tools, no prompt cost. Use the **same** bearer token as the
+gateway (`MCP_GATEWAY_AUTH_TOKEN`): the proxy only ever hands it the two
+meta-tools, and holds the upstream tokens itself. `/health` is unauthenticated
+so the container healthcheck works.
 
 ## Security notes
 
