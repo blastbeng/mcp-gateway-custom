@@ -306,6 +306,49 @@ STOPWORDS = {
 }
 
 
+# A tool is often named by intent ("search the web") while its description is
+# written in implementation words ("Runs headless Chromium against DuckDuckGo,
+# then Bing, Marginalia..."). Cosine similarity then hands the query to a
+# neighbouring tool with a chattier description -- measured: 4/15 correct top-1.
+# This table maps intent words to the tool that answers them. It is server-side,
+# so it costs ZERO prompt tokens: the index is unchanged, only the ranking moves.
+# Measured with the blend below: 13/15 top-1 on the same queries.
+ALIASES = {
+    "web_search": ("search", "web", "news", "latest", "recent", "today", "current",
+                   "internet", "google", "look up", "lookup", "online", "trending",
+                   "cerca", "cercare", "notizie", "ultime", "oggi", "attualita",
+                   "meteo", "weather", "prezzo", "price", "chi e", "who is",
+                   "quando e", "when did", "how much"),
+    "web_url_read": ("url", "http", "website", "web page", "read this link",
+                     "open the link", "fetch the page", "articolo", "article"),
+    "send_message": ("telegram", "send message", "send a message", "notify",
+                     "notification", "invia messaggio", "messaggio su telegram"),
+    "chroma_query_documents": ("memory", "memoria", "remember", "ricorda", "recall",
+                               "preference", "preferenza", "knowledge base",
+                               "memoria semantica", "what did i"),
+    "chroma_add_documents": ("store in memory", "save to memory", "memorizza",
+                             "salva in memoria", "salva questa preferenza",
+                             "store a preference"),
+    "browser_navigate": ("browser", "navigate", "open the page", "playwright",
+                         "apri il sito"),
+    "browser_click": ("click", "button", "submit", "form", "clicca"),
+    "take_screenshot": ("screenshot", "schermata", "capture the page"),
+    "klaket_ingest": ("audio", "video", "transcribe", "trascrivi", "youtube",
+                      "podcast", "sottotitoli"),
+    "read_image": ("image", "immagine", "photo", "foto", "picture", "ocr",
+                   "chart", "grafico", "read the text from"),
+    "ask": ("opinion", "parere", "second opinion", "another model", "council",
+            "ask another llm", "consiglio"),
+    "resolve-library-id": ("library docs", "documentation", "api reference",
+                           "context7", "documentazione"),
+}
+ALIAS_WEIGHT = float(os.environ.get("MCP_LITE_ALIAS_WEIGHT", "0.08"))
+# Small lexical top-up: intent words ("news", "telegram") that the embedding
+# underweights still earn a bonus, scaled to the query's own maximum so it never
+# depends on catalogue size. 0 disables it.
+LEXICAL_WEIGHT = float(os.environ.get("MCP_LITE_LEXICAL_WEIGHT", "0.05"))
+
+
 def _tokens(text):
     out, cur = [], []
     for ch in text.lower():
@@ -873,6 +916,23 @@ class Catalog:
             scores.append(s)
         return scores
 
+    def _alias_boost(self, query, tools):
+        """Intent-word bonus per tool (see ALIASES). Never raises, never embeds."""
+        if not ALIAS_WEIGHT:
+            return [0.0] * len(tools)
+        ql = " ".join(query.lower().split())
+        boosts = [0.0] * len(tools)
+        for i, t in enumerate(tools):
+            terms = ALIASES.get(t["name"])
+            if not terms:
+                continue
+            hits = sum(1 for term in terms if term in ql)
+            if hits:
+                # 2+ intent words is a strong signal, but never above ~0.16 so a
+                # genuinely better semantic match can still win.
+                boosts[i] = min(ALIAS_WEIGHT * hits, 0.16)
+        return boosts
+
     def search(self, query, k=TOP_K, names_only=False):
         # A tool may have appeared or gone since the last build: look at the
         # upstreams again, in the background, without delaying this answer.
@@ -893,6 +953,12 @@ class Catalog:
                 log("query embedding failed (%s): lexical fallback" % e)
         if scores is None:
             scores = self._lexical(query, tools)
+        else:
+            lex = self._lexical(query, tools)
+            top = max(lex) or 1.0
+            if LEXICAL_WEIGHT and lex:
+                scores = [s + LEXICAL_WEIGHT * (l / top) for s, l in zip(scores, lex)]
+        scores = [s + b for s, b in zip(scores, self._alias_boost(query, tools))]
 
         order = sorted(range(len(tools)), key=lambda i: -scores[i])
         if names_only:
@@ -928,38 +994,53 @@ def meta_tools():
     """
     return [
         {
-            "name": "tools_search",
+            # The names are the contract. "tools_search" / "tool_call" read like
+            # "use the search tool" / "call a tool maybe", and a 1.1B-active MoE
+            # answered exactly that way: it searched repeatedly (round 1 and 2
+            # were both searches), then stopped with an empty answer -- measured
+            # as the Open WebUI hang. "find_tool" / "run_tool" name the *effect*
+            # (look up a schema vs produce real data) and the same model emits
+            # find_tool then run_tool on the first try. Old names still work, so
+            # prompts and clients that already say tools_search keep working.
+            "name": "find_tool",
             "description": (
-                "Search the MCP tool catalogue. " + CATALOG.map_line() + ". Pass the task "
-                "in natural language; returns the FULL JSON schema of the k best matching "
-                "tools plus the names of other close matches. ALWAYS call this before "
-                "acting: the schemas are not in the prompt, so you must not guess a tool "
-                "name or its arguments. The list is the DOMAINS behind this proxy, not the "
-                "whole catalogue: search even when nothing there seems to fit. Use "
-                "names_only=true to browse the whole catalogue by name."),
+                "Look up the schema of a tool in the catalogue. " + CATALOG.map_line() +
+                ". This only RETURNS SCHEMAS: it runs nothing and contains no "
+                "real-world data. After it returns, call run_tool with the best name "
+                "and its arguments. ALWAYS call this before acting: the schemas are "
+                "not in the prompt, so you must not guess a tool name or its "
+                "arguments. The list is the DOMAINS behind this proxy, not the whole "
+                "catalogue: search even when nothing there seems to fit."),
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string",
-                              "description": "what you need to do, in natural language"},
+                    "query": {
+                        "type": "string",
+                        "description": "The ACTION you need, in English: 'search the "
+                                       "web for X', 'read this URL', 'send a telegram "
+                                       "message', 'query semantic memory'. Never the "
+                                       "user's question verbatim."},
                     "k": {"type": "integer", "minimum": 1, "maximum": 8, "default": TOP_K,
-                          "description": "how many full schemas to return (default %d)" % TOP_K},
+                          "description": "how many schemas to return (default %d)" % TOP_K},
                     "names_only": {"type": "boolean", "default": False,
-                                   "description": "return only a name+one-line list instead of full schemas"},
+                                   "description": "names + one-line summary only, no "
+                                                  "schemas; you cannot run_tool from this"},
                 },
                 "required": ["query"],
             },
         },
         {
-            "name": "tool_call",
+            "name": "run_tool",
             "description": (
-                "Execute any tool from the catalogue by its exact name, with a JSON "
-                "arguments object that matches the schema returned by tools_search. "
-                "The result is returned verbatim (text, images, structured content)."),
+                "Execute a catalogue tool by its exact name, with a JSON arguments "
+                "object that matches the schema find_tool returned. This is the only "
+                "way to obtain real data: web results, page content, sent messages, "
+                "memory. The result is returned verbatim (text, images, structured "
+                "content)."),
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "name": {"type": "string", "description": "exact tool name"},
+                    "name": {"type": "string", "description": "exact tool name from find_tool"},
                     "arguments": {"type": "object",
                                   "description": "arguments object for that tool"},
                 },
@@ -996,10 +1077,10 @@ def handle_tool_call(name, arguments):
     if not isinstance(arguments, dict):
         arguments = {}
 
-    if name == "tools_search":
+    if name in ("find_tool", "tools_search"):
         query = arguments.get("query") or arguments.get("q") or ""
         if not isinstance(query, str) or not query.strip():
-            raise RpcError("tools_search needs a non-empty 'query'")
+            raise RpcError("find_tool needs a non-empty 'query'")
         try:
             k = int(arguments.get("k") or TOP_K)
         except Exception:
@@ -1008,10 +1089,10 @@ def handle_tool_call(name, arguments):
         res = CATALOG.search(query, k=k, names_only=bool(arguments.get("names_only")))
         return _text_result(json.dumps(res, ensure_ascii=False))
 
-    if name == "tool_call":
+    if name in ("run_tool", "tool_call"):
         target = arguments.get("name") or arguments.get("tool")
         if not target:
-            raise RpcError("tool_call needs 'name' (the tool to execute)")
+            raise RpcError("run_tool needs 'name' (the tool to execute)")
         inner = arguments.get("arguments")
         if inner is None:
             inner = arguments.get("args") or {}
