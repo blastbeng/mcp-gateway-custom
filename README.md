@@ -73,14 +73,47 @@ small machine:
   tool selection therefore does not help either: the surface must be small **and
   constant**.
 
-`tools/list` answers with exactly two tools (**1,870 chars, ~467 tokens** on
-the 109-tool catalogue, capability map included; ~1,260 chars / ~315 tokens
-without it):
+`tools/list` answers with exactly two tools when no flat tools are configured
+(**1,870 chars, ~467 tokens** on the 109-tool catalogue, capability map included;
+~1,260 chars / ~315 tokens without it) — this deployment advertises six flat
+tools alongside them, see the next section:
 
 | Tool | What it does |
 |---|---|
 | `tools_search(query, k=3, names_only=false)` | Semantic search over the catalogue with the stack's own `embedding-model`; returns the **full JSON schema** of the k best matches, the names of close matches, the catalogue size and the servers. Its description also carries the **capability map** (below): the model would otherwise have no idea what is worth searching for. `names_only=true` browses the whole catalogue by name (40 entries) |
 | `tool_call(name, arguments)` | Executes any catalogue tool on its upstream and relays the result verbatim (text, images, structured content), including `isError` |
+
+#### Flat tools: what the small model is allowed to call directly
+
+The two meta-tools above are the surface for capable clients. The cheap node's
+1.5B-active MoE cannot drive them: `tools_search` → `tool_call` is indirection,
+and it ranks `ask` for "Gerry Scotti" and gets 14 kB back (**1/3 usable**), while
+it calls one flat tool by name with the right arguments **5/5**. So
+`MCP_LITE_FLAT_TOOLS` names the everyday tools and they are advertised next to
+the meta-tools, each with a hand-written minimal schema where the model has
+proven it invents things (`chatId`, `freshness`, `site`, `collection_name`).
+
+| Flat tool | Note |
+|---|---|
+| `web_search` | answers from the snippets; the description says so, because a snippet that stops before the fact is what sends the model off to read the whole page |
+| `web_url_read` | asks upstream for a 60 k window, keeps the article, cuts to the caller's size (menus and link farms stripped — see `_readable`) |
+| `search_and_read` | **the proxy's own tool**: runs `web_search`, reads the top hit, returns the article plus the other results as one line each — one model hop where search-then-read costs two. Never returns empty: a failed read falls back to the snippets and says so |
+| `send_message` / `read_image` / `chroma_query_documents` | one fixed Telegram chat; the Chroma collection comes from `MCP_LITE_MEMORY_COLLECTION`, not from the model |
+
+Surface as shipped (measured, `tools/list` on `:8814`): **8 tools, 5,442 chars of
+schema** — ~1,450 tokens, paid once per conversation by the prefix cache. The
+rendering budgets are `MCP_LITE_FLAT_AUTO_DESC` / `MCP_LITE_FLAT_PARAM_DESC`, the
+answer shapes `MCP_LITE_FLAT_MAX_RESULTS` / `MCP_LITE_FLAT_SNIPPET` (this
+deployment: 5 × 500) and, for memory only, `MCP_LITE_MEMORY_MAX_RESULTS` /
+`MCP_LITE_MEMORY_SNIPPET` (4 × 600: widening the search shape must not silently
+double a memory answer).
+
+Measured on the production sentence "cerca sul web chi è Gerry Scotti" against
+the real router + tools: **2 hops / 109.5 s** when the fact is in the snippets
+(was 6 hops / 252 s, and the browser stopped waiting at 137 s). On a question
+that genuinely needs the page ("quanti figli ha…?"): 3–4 hops, 208–283 s, correct
+in 2/3 runs — the model repeats an identical call on the third hop, which is a
+model limit, not a tool one.
 
 #### Capability map: what kind of MCPs are behind the proxy
 
@@ -194,6 +227,12 @@ them.
 | `MCP_LITE_CACHE` | `/cache/index.json` | index cache (survives restarts) |
 | `MCP_LITE_IDLE_TTL` | `900` | release upstream sessions after this many idle seconds |
 | `MCP_LITE_CALL_TIMEOUT` | `900` | budget of one real tool call |
+| `MCP_LITE_FLAT_TOOLS` | none | the everyday tools advertised flat, next to the meta-tools (`search_and_read` is the proxy's own) |
+| `MCP_LITE_META_TOOLS` | `1` | `0` drops the two meta-tools: a surface of flat tools only |
+| `MCP_LITE_FLAT_MAX_RESULTS` / `MCP_LITE_FLAT_SNIPPET` | `4` / `300` | shape of a `web_search`/`search_and_read` answer (this deployment: `5` / `500`) |
+| `MCP_LITE_MEMORY_MAX_RESULTS` / `MCP_LITE_MEMORY_SNIPPET` | `4` / `600` | shape of a `chroma_query_documents` answer, kept separate on purpose |
+| `MCP_LITE_FLAT_AUTO_DESC` / `MCP_LITE_FLAT_PARAM_DESC` | `200` / `90` | budgets of a derived flat description/param; hand-written specs are not cut |
+| `MCP_LITE_MEMORY_COLLECTION` | none | collection the flat `chroma_query_documents` reads (the model cannot guess it) |
 
 `manage-docker` restarts the service on its own when `tools-lite/proxy.py` is
 newer than the running container (the image is a plain `python:3.12-alpine`, so

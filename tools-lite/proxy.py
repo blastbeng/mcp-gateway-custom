@@ -166,8 +166,16 @@ FLAT_PARAM_DESC = int(os.environ.get("MCP_LITE_FLAT_PARAM_DESC", "90"))
 # Four results of 300 chars, not three of 220: the snippets are what the model
 # answers from, and a too-short snippet is exactly why it decides it needs the
 # whole page (and then reads page chrome, see _readable below).
+# The deployment runs 5 results of 500 chars (measured on Open WebUI: a 300-char
+# snippet of the Gerry Scotti Wikipedia lead cut off before the fact being asked
+# for, so the model read the page anyway — one hop it did not need). The surface
+# pays ~350 chars of schema-free output per call for it, which is one hop less.
 FLAT_MAX_RESULTS = int(os.environ.get("MCP_LITE_FLAT_MAX_RESULTS", "4"))
 FLAT_SNIPPET = int(os.environ.get("MCP_LITE_FLAT_SNIPPET", "300"))
+# The memory renderer keeps its own sizes: widening the search knobs above must
+# not silently double what a memory call returns.
+MEMORY_MAX_RESULTS = int(os.environ.get("MCP_LITE_MEMORY_MAX_RESULTS", "4"))
+MEMORY_SNIPPET = int(os.environ.get("MCP_LITE_MEMORY_SNIPPET", "600"))
 
 # Reading a page: the upstream converts HTML to markdown but keeps the chrome,
 # so on it.wikipedia.org the first 2 kB are "Vai al contenuto", "Menu
@@ -195,7 +203,9 @@ FLAT_SPECS = {
                         "find), or asks about a person, a company, news, prices or any fact "
                         "you are not sure of. Never answer such a question from memory: the "
                         "snippets are the only source of truth. Returns title, URL and "
-                        "snippet for the best results."),
+                        "snippet for the best results. Answer from these snippets: open a "
+                        "page only when one is not enough, and then call search_and_read "
+                        "once (it searches and reads in a single call)."),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -238,6 +248,33 @@ FLAT_SPECS = {
                               "description": "max characters to return (default 4000)"},
             },
             "required": ["url"],
+        },
+    },
+    # search_and_read: this proxy's own tool (not in the catalogue), implemented
+    # by running web_search and then web_url_read on the best hit. On the cheap
+    # node a search and a page read are two model hops of ~30 s each (measured
+    # on Open WebUI chat 0407eb2f: reasoning 11 s + search 1.8 s + reasoning
+    # 28 s + reasoning 30 s + read 3 s + reasoning 30 s + answer, 252 s for
+    # "chi è Gerry Scotti"). One tool, one hop, and the answer is already in the
+    # result, so the model has nothing left to plan.
+    "search_and_read": {
+        "description": ("Search the public web and return the top result's article text in "
+                        "one call (menus and navigation already removed), plus the other "
+                        "results as one line each. Call it for any factual question the user "
+                        "asks you to look up: it answers the search and the page read at "
+                        "once, so you do not need web_search or web_url_read first. Prefer "
+                        "it over searching and then reading a page in two calls."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string",
+                          "description": "search keywords, e.g. 'Gerry Scotti biografia'"},
+                "url": {"type": "string",
+                        "description": "optional: read this URL instead of the top result"},
+                "maxLength": {"type": "integer",
+                              "description": "max characters of article text (default 4000)"},
+            },
+            "required": ["query"],
         },
     },
     # chroma_query_documents: upstream wants `collection_name` + an array of
@@ -1242,12 +1279,13 @@ def flat_tools():
     A hand-written FLAT_SPECS entry wins (it is the instruction, when there is
     room for one); otherwise a compact schema is derived from the catalogue.
     Only tools the catalogue really has are exposed: a typo in the env var must
-    not advertise a tool that cannot be executed.
+    not advertise a tool that cannot be executed. The exception is PROXY_TOOLS,
+    which this proxy implements itself and so already has a hand-written schema.
     """
     out = []
     for name in FLAT_TOOLS:
         tool = CATALOG.by_name.get(name)
-        if tool is None:
+        if tool is None and name not in PROXY_TOOLS:
             log("flat tool %r is not in the catalogue, skipping" % name)
             continue
         spec = dict(FLAT_SPECS.get(name) or _compact_spec(tool))
@@ -1314,14 +1352,14 @@ def _flat_memory(result):
     except Exception:
         return result
     lines = []
-    for doc in docs[:FLAT_MAX_RESULTS]:
+    for doc in docs[:MEMORY_MAX_RESULTS]:
         text = " ".join(str(doc or "").split())
         if text:
-            lines.append("- " + text[:FLAT_SNIPPET * 2])
+            lines.append("- " + text[:MEMORY_SNIPPET])
     if not lines:
         return result
-    if len(docs) > FLAT_MAX_RESULTS:
-        lines.append("(%d more notes not shown)" % (len(docs) - FLAT_MAX_RESULTS))
+    if len(docs) > MEMORY_MAX_RESULTS:
+        lines.append("(%d more notes not shown)" % (len(docs) - MEMORY_MAX_RESULTS))
     return _text_result("\n".join(lines))
 
 
@@ -1516,6 +1554,92 @@ def _run_tool(name, arguments):
     return up.rpc("tools/call", {"name": name, "arguments": arguments}, timeout=CALL_TIMEOUT)
 
 
+def _rows_of(result):
+    """The results array of a raw `web_search` reply, or None on any surprise."""
+    try:
+        rows = json.loads(result["content"][0]["text"])["results"]
+        return rows if isinstance(rows, list) and rows else None
+    except Exception:
+        return None
+
+
+def _search_and_read(arguments):
+    """Search the web, then read the top hit: one tool call, one model hop.
+
+    Both halves are the real upstream tools, so a client that calls them
+    directly is untouched. The result is never empty: when the read fails the
+    snippets come back with a line saying so, because an empty tool result is
+    what sends a small model off to plan a third call.
+    """
+    query = str(arguments.get("query") or "").strip()
+    if not query:
+        raise RpcError("search_and_read needs a 'query'")
+    try:
+        want = int(arguments.get("maxLength") or URL_READ_DEFAULT)
+    except (TypeError, ValueError):
+        want = URL_READ_DEFAULT
+    want = max(1, want)
+
+    rows, search, note = None, None, ""
+    url = str(arguments.get("url") or "").strip()
+    if not url:
+        search = _run_tool("web_search", {"query": query, "count": FLAT_MAX_RESULTS})
+        rows = _rows_of(search)
+        if rows is None:
+            return search          # nothing usable came back: pass through what we have
+        url = next((str(r["url"]).strip() for r in rows
+                    if isinstance(r, dict) and str(r.get("url") or "").strip()), "")
+    if not url:
+        return _flat_web_search(search)
+
+    text = ""
+    try:
+        read = _run_tool("web_url_read", {"url": url, "maxLength": URL_READ_WINDOW})
+    except RpcError as exc:
+        note = "page read failed: %s" % exc
+    else:
+        if read.get("isError"):
+            # the upstream's own error text, not the Python repr of its content
+            try:
+                why = str(read["content"][0]["text"])
+            except Exception:
+                why = str(read.get("content") or "")
+            note = "page read failed: %s" % " ".join(why.split())[:200]
+        else:
+            try:
+                text = str(read["content"][0]["text"] or "")
+            except Exception:
+                text = ""
+
+    body = _truncate(_flatten_links(_readable(text)), want) if text.strip() else ""
+    if not body:
+        note = note or "the page returned no readable text"
+        if search is None:
+            search = _run_tool("web_search", {"query": query, "count": FLAT_MAX_RESULTS})
+        body = _flat_web_search(search)["content"][0]["text"]
+
+    lines = ["Source: %s" % url]
+    if note:
+        lines.append("(%s)" % note)
+    lines += ["", body]
+    other = [r for r in (rows or [])
+             if isinstance(r, dict) and str(r.get("url") or "").strip() != url]
+    if other:
+        lines += ["", "Other results:"]
+        for row in other[:FLAT_MAX_RESULTS - 1]:
+            title = (row.get("title") or "(no title)").strip()
+            lines.append("- %s - %s" % (title[:120], str(row["url"]).strip()))
+    return _text_result("\n".join(lines))
+
+
+# Tools this proxy implements itself instead of forwarding: the schema is the
+# hand-written one in FLAT_SPECS, the handler runs the real tools above. They
+# are advertised on the flat surface, so `flat_tools` must not drop them for
+# being absent from the catalogue.
+PROXY_TOOLS = {"search_and_read"}
+PROXY_HANDLERS = {"search_and_read": _search_and_read}
+
+
 def handle_tool_call(name, arguments):
     if isinstance(arguments, str):
         try:
@@ -1555,6 +1679,10 @@ def handle_tool_call(name, arguments):
         if not isinstance(inner, dict):
             inner = {}
         return _run_tool(target, inner)
+
+    # A tool this proxy builds itself, out of the real ones (search_and_read).
+    if name in PROXY_HANDLERS:
+        return PROXY_HANDLERS[name](arguments)
 
     # A client that still has a stale list can call a real tool directly.
     if name in FLAT_TOOLS:
