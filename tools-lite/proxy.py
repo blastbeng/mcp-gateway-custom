@@ -124,6 +124,127 @@ IDLE_SWEEP = max(1.0, float(os.environ.get("MCP_LITE_IDLE_SWEEP", "30")))
 
 STABLE_SID = "tools-lite-stable"
 
+# --------------------------------------------------------------------------
+# shortcut surface: curated flat tools next to the two meta-tools
+# --------------------------------------------------------------------------
+# The two meta-tools are the right surface for a capable model: one lookup, one
+# call, and the whole catalogue stays reachable. A 1.5B-active MoE cannot do
+# that indirection. Measured on the cheap node (LFM2.5-8B-A1B, Open WebUI
+# payload, same system message and tools):
+#
+#   meta-tools only (find_tool/run_tool) -> hop 1 emits find_tool 4/5, but the
+#       full find_tool -> run_tool -> answer chain is 1/3 usable (LOOP, LOOP,
+#       empty answer): find_tool("Gerry Scotti") ranks `ask` and answers 14 kB;
+#   + flat web_search(query)             -> the model calls web_search 5/5 with
+#       the right arguments, 12-16 s, and writes the answer from the snippets.
+#
+# So the flat tools are a SHORTCUT, not a replacement: the same single surface
+# advertises the everyday tools with curated minimal schemas AND find_tool/
+# run_tool, which keep all 109 tools reachable. A tool named in
+# MCP_LITE_FLAT_TOOLS without a hand-written schema gets a compact one derived
+# from the catalogue (name + trimmed description + typed parameters), because
+# the upstream schema of e.g. find_tool's own result is 1.4-3 kB per tool.
+#
+# Second hop, answering from the result: the upstream schema is also too much.
+# With the raw 1.5 kB web_search JSON the model returns an EMPTY answer at
+# reasoning budget 96-128 (0/3, 1/3); with two or three compact
+# "title / url / snippet" lines it answers 3/3 at budget 256. So a flat tool
+# here means: a curated MINIMAL schema (query + count only - the optional
+# `freshness`/`site` fields were measured to be invented as `freshness:"day"`,
+# `site:"italiano"`, which then filters out the answer) and a compact render of
+# the result. `run_tool` keeps returning the payload verbatim.
+#
+# Off by default: with MCP_LITE_FLAT_TOOLS empty the surface stays the two
+# meta-tools, so other clients of this proxy are untouched.
+FLAT_TOOLS = [n.strip() for n in os.environ.get("MCP_LITE_FLAT_TOOLS", "").split(",") if n.strip()]
+META_TOOLS_ENABLED = os.environ.get("MCP_LITE_META_TOOLS", "1") != "0"
+# An auto-generated description, not the upstream one: the catalogue's longest
+# descriptions run to 700+ chars and the model only needs to recognise the tool.
+FLAT_AUTO_DESC = int(os.environ.get("MCP_LITE_FLAT_AUTO_DESC", "200"))
+FLAT_PARAM_DESC = int(os.environ.get("MCP_LITE_FLAT_PARAM_DESC", "90"))
+FLAT_MAX_RESULTS = int(os.environ.get("MCP_LITE_FLAT_MAX_RESULTS", "3"))
+FLAT_SNIPPET = int(os.environ.get("MCP_LITE_FLAT_SNIPPET", "220"))
+
+FLAT_SPECS = {
+    "web_search": {
+        "name": "web_search",
+        # The description is the only system prompt this surface has (the router
+        # deliberately injects none), so it carries the instruction. Measured on
+        # the production sentence "cerca sul web chi è Gerry Scotti": the softer
+        # "use it when the user asks about a person" wording answered from memory
+        # in 1 of 3 runs (and got the person wrong), so this one says what to do,
+        # forbids answering from memory, and lists the trigger words.
+        "description": ("Search the public web right now. Call this tool whenever the user "
+                        "asks you to search something (cerca, cercami, search, look up, "
+                        "find), or asks about a person, a company, news, prices or any fact "
+                        "you are not sure of. Never answer such a question from memory: the "
+                        "snippets are the only source of truth. Returns title, URL and "
+                        "snippet for the best results."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string",
+                          "description": "search keywords, e.g. 'Gerry Scotti biografia'"},
+                "count": {"type": "integer", "minimum": 1, "maximum": 8,
+                          "default": 3, "description": "how many results (default 3)"},
+            },
+            "required": ["query"],
+        },
+    },
+    # send_message: the upstream schema has a `chatId` override, and the MoE
+    # filled it with `"blast"` every time. The chat is fixed by the gateway, so
+    # the flat schema does not offer the field at all.
+    "send_message": {
+        "description": ("Send a text message to the user on Telegram. Call it when the "
+                        "user asks to send, notify or message something. The chat is "
+                        "fixed: pass only the text."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "message text to send"},
+            },
+            "required": ["text"],
+        },
+    },
+    "web_url_read": {
+        "description": ("Fetch a web page and return its readable text as markdown. Call it "
+                        "when the user gives a URL, or when a search result is only a "
+                        "snippet and the answer needs the whole page."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "absolute URL to read"},
+                "maxLength": {"type": "integer",
+                              "description": "max characters to return (default 4000)"},
+            },
+            "required": ["url"],
+        },
+    },
+    # chroma_query_documents: upstream wants `collection_name` + an array of
+    # query texts. A model that has to name a Chroma collection gets it wrong or
+    # asks `find_tool` instead (0/3 on "cerca nella memoria del progetto"), so
+    # the flat schema takes a plain `query` and the adapter below fills in the
+    # collection configured for this deployment.
+    "chroma_query_documents": {
+        "description": ("Search the project's long-term memory (Chroma). Call it when the "
+                        "user asks what was decided, known or done before about a topic."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "what to look for"},
+                "n_results": {"type": "integer", "default": 3,
+                              "description": "how many notes (default 3)"},
+            },
+            "required": ["query"],
+        },
+    },
+}
+
+# Collection the flat `chroma_query_documents` reads. Set per deployment: the
+# cheap surface serves one project, and its collection name is the one thing the
+# model cannot guess.
+MEMORY_COLLECTION = os.environ.get("MCP_LITE_MEMORY_COLLECTION", "")
+
 
 def log(msg):
     sys.stderr.write("[tools-lite] %s\n" % msg)
@@ -1050,6 +1171,167 @@ def meta_tools():
     ]
 
 
+def _short(text, limit):
+    text = " ".join((text or "").split())
+    if len(text) <= limit:
+        return text
+    return text[:limit].rsplit(" ", 1)[0] + "..."
+
+
+def _compact_spec(tool):
+    """Derive a minimal schema from a catalogue entry.
+
+    For a tool in MCP_LITE_FLAT_TOOLS that has no hand-written spec: name, a
+    trimmed description, and its parameters with type/enum/default and a
+    trimmed description. Upstream schemas run to 1.4-3 kB each (long prose,
+    nested objects, examples); what the model needs to pick a tool and fill it
+    is this.
+    """
+    src = tool.get("inputSchema") or {}
+    props = {}
+    for pname, pspec in (src.get("properties") or {}).items():
+        if not isinstance(pspec, dict):
+            continue
+        clean = {}
+        ptype = pspec.get("type")
+        if isinstance(ptype, list):
+            ptype = next((t for t in ptype if isinstance(t, str)), None)
+        if isinstance(ptype, str) and ptype != "null":
+            clean["type"] = ptype
+        if pspec.get("description"):
+            clean["description"] = _short(pspec["description"], FLAT_PARAM_DESC)
+        if isinstance(pspec.get("enum"), list) and pspec["enum"]:
+            clean["enum"] = pspec["enum"][:12]
+        if isinstance(pspec.get("default"), (str, int, float, bool)):
+            clean["default"] = pspec["default"]
+        props[pname] = clean
+    schema = {"type": "object", "properties": props}
+    required = [r for r in (src.get("required") or []) if r in props]
+    if required:
+        schema["required"] = required
+    return {
+        "name": tool["name"],
+        "description": _short(tool.get("description"), FLAT_AUTO_DESC) or tool["name"],
+        "inputSchema": schema,
+    }
+
+
+def flat_tools():
+    """Schemas for the tools named in MCP_LITE_FLAT_TOOLS.
+
+    A hand-written FLAT_SPECS entry wins (it is the instruction, when there is
+    room for one); otherwise a compact schema is derived from the catalogue.
+    Only tools the catalogue really has are exposed: a typo in the env var must
+    not advertise a tool that cannot be executed.
+    """
+    out = []
+    for name in FLAT_TOOLS:
+        tool = CATALOG.by_name.get(name)
+        if tool is None:
+            log("flat tool %r is not in the catalogue, skipping" % name)
+            continue
+        spec = dict(FLAT_SPECS.get(name) or _compact_spec(tool))
+        spec["name"] = name
+        out.append(spec)
+    return out
+
+
+_SURFACE_DIGEST = None
+
+
+def _log_surface(tools):
+    """Log the advertised surface once per change (it rides every request)."""
+    global _SURFACE_DIGEST
+    digest = hashlib.sha256(json.dumps(tools, sort_keys=True).encode()).hexdigest()
+    if digest == _SURFACE_DIGEST:
+        return
+    _SURFACE_DIGEST = digest
+    chars = len(json.dumps(tools))
+    log("surface: %d tools, %d chars of schema (%s)"
+        % (len(tools), chars, ", ".join(t["name"] for t in tools)))
+
+
+def _flat_web_search(result):
+    """Render web_search JSON as a few dense lines.
+
+    The model copies what it reads: 1.5 kB of JSON with `lanes`, `cached` and
+    `tookMs` is what turns the synthesis turn into an empty answer, while three
+    "title / url / snippet" lines get answered. Anything unexpected (an error
+    string, a different shape) is passed through untouched.
+    """
+    try:
+        data = json.loads(result["content"][0]["text"])
+        rows = data["results"]
+        if not isinstance(rows, list) or not rows:
+            return result
+    except Exception:
+        return result
+    lines = []
+    for i, row in enumerate(rows[:FLAT_MAX_RESULTS], 1):
+        title = (row.get("title") or "").strip()
+        lines.append("%d. %s" % (i, title or "(no title)"))
+        if row.get("url"):
+            lines.append("   %s" % row["url"].strip())
+        snippet = (row.get("snippet") or row.get("content") or "").strip()
+        if snippet:
+            lines.append("   %s" % snippet[:FLAT_SNIPPET])
+    if len(rows) > FLAT_MAX_RESULTS:
+        lines.append("(%d more results not shown)" % (len(rows) - FLAT_MAX_RESULTS))
+    return _text_result("\n".join(lines))
+
+
+def _flat_memory(result):
+    """Render chroma results as a few dense notes.
+
+    Same reason as web_search: ids, distances and `null` arrays are what the
+    synthesis turn copies instead of the documents.
+    """
+    try:
+        data = json.loads(result["content"][0]["text"])
+        docs = (data.get("documents") or [[]])[0]
+        if not isinstance(docs, list) or not docs:
+            return result
+    except Exception:
+        return result
+    lines = []
+    for doc in docs[:FLAT_MAX_RESULTS]:
+        text = " ".join(str(doc or "").split())
+        if text:
+            lines.append("- " + text[:FLAT_SNIPPET * 2])
+    if not lines:
+        return result
+    if len(docs) > FLAT_MAX_RESULTS:
+        lines.append("(%d more notes not shown)" % (len(docs) - FLAT_MAX_RESULTS))
+    return _text_result("\n".join(lines))
+
+
+FLAT_FORMATTERS = {"web_search": _flat_web_search,
+                   "chroma_query_documents": _flat_memory}
+
+
+def _adapt_memory(arguments):
+    """Turn the flat `query` into what the Chroma server expects."""
+    query = arguments.get("query") or arguments.get("query_texts") or ""
+    if isinstance(query, str):
+        texts = [query] if query else []
+    elif isinstance(query, list):
+        texts = [str(q) for q in query]
+    else:
+        texts = []
+    out = {"query_texts": texts}
+    try:
+        out["n_results"] = max(1, int(arguments.get("n_results") or 3))
+    except Exception:
+        out["n_results"] = 3
+    collection = MEMORY_COLLECTION or arguments.get("collection_name")
+    if collection:
+        out["collection_name"] = collection
+    return out
+
+
+FLAT_ADAPTERS = {"chroma_query_documents": _adapt_memory}
+
+
 def _text_result(text, is_error=False):
     return {"content": [{"type": "text", "text": text}], "isError": bool(is_error)}
 
@@ -1109,7 +1391,15 @@ def handle_tool_call(name, arguments):
         return _run_tool(target, inner)
 
     # A client that still has a stale list can call a real tool directly.
-    return _run_tool(name, arguments)
+    if name in FLAT_TOOLS:
+        adapt = FLAT_ADAPTERS.get(name)
+        if adapt is not None:
+            arguments = adapt(arguments)
+    out = _run_tool(name, arguments)
+    fmt = FLAT_FORMATTERS.get(name)
+    if fmt is not None and name in FLAT_TOOLS:
+        return fmt(out)
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -1320,13 +1610,22 @@ class Handler(BaseHTTPRequestHandler):
         params = msg.get("params") or {}
 
         if method == "initialize":
+            instructions = ("This server exposes the whole MCP catalogue behind two tools: "
+                            "tools_search and tool_call. Call tools_search with the task "
+                            "before using any tool. Behind it: " + CATALOG.map_line())
+            flat = flat_tools()
+            if flat:
+                # The flat tools are the everyday shortcut: name them first and
+                # leave the meta-tools as the way to reach everything else.
+                instructions = ("Available tools: " + ", ".join(t["name"] for t in flat) +
+                                ". Call one of them directly with its arguments.")
+                if META_TOOLS_ENABLED:
+                    instructions += (" For anything else, use tools_search and then tool_call.")
             self._json(mid, {
                 "protocolVersion": "2025-03-26",
                 "capabilities": {"tools": {"listChanged": False}},
                 "serverInfo": {"name": "mcp-tools-lite", "version": "1.0"},
-                "instructions": ("This server exposes the whole MCP catalogue behind two tools: "
-                                 "tools_search and tool_call. Call tools_search with the task "
-                                 "before using any tool. Behind it: " + CATALOG.map_line()),
+                "instructions": instructions,
             })
             return
 
@@ -1341,7 +1640,9 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if method == "tools/list":
-            self._json(mid, {"tools": meta_tools()})
+            tools = flat_tools() + (meta_tools() if META_TOOLS_ENABLED else [])
+            _log_surface(tools)
+            self._json(mid, {"tools": tools})
             CATALOG.maybe_refresh_async()
             return
 

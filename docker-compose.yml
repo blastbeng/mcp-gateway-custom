@@ -622,6 +622,19 @@ services:
       # the upstream sessions are released, so the gateway stops the long-lived
       # child containers (Chromium, ...) it keeps per session.
       MCP_LITE_IDLE_TTL: "900"
+      # The everyday tools, advertised flat next to the two meta-tools: one
+      # surface, all 109 tools still reachable through tools_search/tool_call.
+      # The cheap node's 1.5B-active MoE cannot drive the meta-tool
+      # indirection (find_tool -> tool_call -> answer is 1/3 usable: it ranks
+      # `ask` for "Gerry Scotti" and gets 14 kB back), while it calls a flat
+      # web_search 5/5 with the right arguments. So the same proxy names these
+      # five directly and keeps the catalogue behind the meta-tools for
+      # everything else. web_search has a hand-written minimal schema;
+      # the others get a compact one derived from the catalogue.
+      MCP_LITE_FLAT_TOOLS: "web_search,web_url_read,send_message,read_image,chroma_query_documents"
+      # The flat chroma tool takes `query` only: the model cannot guess a
+      # collection name, so the deployment supplies it.
+      MCP_LITE_MEMORY_COLLECTION: "aiderdesk_cheap-llm-stack_memory"
     ports:
       - "8814:8814"
     extra_hosts:
@@ -642,6 +655,7 @@ services:
       - mcp-gateway
     networks:
       - mcp
+
 volumes:
 
   searxng-cache:
