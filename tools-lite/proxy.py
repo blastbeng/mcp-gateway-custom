@@ -81,6 +81,7 @@ import hmac
 import json
 import math
 import os
+import re
 import sys
 import threading
 import time
@@ -162,8 +163,23 @@ META_TOOLS_ENABLED = os.environ.get("MCP_LITE_META_TOOLS", "1") != "0"
 # descriptions run to 700+ chars and the model only needs to recognise the tool.
 FLAT_AUTO_DESC = int(os.environ.get("MCP_LITE_FLAT_AUTO_DESC", "200"))
 FLAT_PARAM_DESC = int(os.environ.get("MCP_LITE_FLAT_PARAM_DESC", "90"))
-FLAT_MAX_RESULTS = int(os.environ.get("MCP_LITE_FLAT_MAX_RESULTS", "3"))
-FLAT_SNIPPET = int(os.environ.get("MCP_LITE_FLAT_SNIPPET", "220"))
+# Four results of 300 chars, not three of 220: the snippets are what the model
+# answers from, and a too-short snippet is exactly why it decides it needs the
+# whole page (and then reads page chrome, see _readable below).
+FLAT_MAX_RESULTS = int(os.environ.get("MCP_LITE_FLAT_MAX_RESULTS", "4"))
+FLAT_SNIPPET = int(os.environ.get("MCP_LITE_FLAT_SNIPPET", "300"))
+
+# Reading a page: the upstream converts HTML to markdown but keeps the chrome,
+# so on it.wikipedia.org the first 2 kB are "Vai al contenuto", "Menu
+# principale", the language list and the search box. A model that asks for 2000
+# chars therefore reads navigation and asks for the next page — measured on
+# Open WebUI chat 1f7d4872: three tool turns of 55 s, then a turn with no
+# content left (its whole thinking budget spent planning another fetch).
+# So the flat tool asks upstream for a much larger window than the caller
+# wanted, keeps the article, and only then truncates to the caller's size.
+URL_READ_DEFAULT = int(os.environ.get("MCP_LITE_URL_READ_DEFAULT", "4000"))
+URL_READ_WINDOW = int(os.environ.get("MCP_LITE_URL_READ_WINDOW", "60000"))
+URL_READ_MIN_KEEP = int(os.environ.get("MCP_LITE_URL_READ_MIN_KEEP", "400"))
 
 FLAT_SPECS = {
     "web_search": {
@@ -207,9 +223,13 @@ FLAT_SPECS = {
         },
     },
     "web_url_read": {
-        "description": ("Fetch a web page and return its readable text as markdown. Call it "
-                        "when the user gives a URL, or when a search result is only a "
-                        "snippet and the answer needs the whole page."),
+        # The page is fetched and then stripped of menus, navigation and footers
+        # (_readable), so what comes back starts with the article. One call is
+        # enough for a fact: read it, then answer.
+        "description": ("Fetch a web page and return its article text (menus and navigation "
+                        "already removed). Call it when the user gives a URL, or when a "
+                        "search result is only a snippet and the answer needs the whole "
+                        "page. One call is normally enough: read the result and answer."),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1305,7 +1325,152 @@ def _flat_memory(result):
     return _text_result("\n".join(lines))
 
 
+_MD_IMAGE = re.compile(r"!\[[^\]\[]*\]\([^()\s]*(?:\s+\"[^\"]*\")?\)")
+_MD_LINK = re.compile(r"\[([^\]\[]*)\]\([^()\s]*(?:\s+\"[^\"]*\")?\)")
+_SENTENCE = re.compile(r"[.!?…][\"'”’)\]]?(?:\s|$)")
+_BLOCKS = re.compile(r"\n\s*\n")
+# A block that is only a menu label, in the two languages this stack is used in.
+_CHROME_WORDS = re.compile(
+    r"^(vai al contenuto|jump to content|menu principale|main menu|navigazione|"
+    r"navigation|ricerca|search|aspetto|appearance|contenuti|contents|strumenti|"
+    r"tools|lingue|languages|altri progetti|community|comunità|personal tools|"
+    r"toggle sidebar|fai una donazione|donate|pagina principale|main page)$",
+    re.IGNORECASE)
+_LIST_MARKS = ("* ", "- ", "+ ", "|", ">")
+_CITATION = re.compile(r"\[\\\[(\d+)\\\]\]\([^)]*\)")
+_ESCAPES = re.compile(r"\\([.()\[\]!?,'\"-])")
+
+
+def _plain(block):
+    """The text a reader would see: links to their label, no markup."""
+    text = _MD_IMAGE.sub(" ", block)
+    text = _MD_LINK.sub(lambda m: m.group(1), text)
+    text = text.replace("**", "").replace("__", "").replace("`", "")
+    return " ".join(text.split())
+
+
+def _is_chrome(block):
+    stripped = block.strip()
+    if not stripped:
+        return True
+    plain = _plain(stripped)
+    if not plain:
+        return True
+    if _CHROME_WORDS.match(plain):
+        return True
+    if stripped.startswith(_LIST_MARKS[:3]) and len(plain) < 120 and not _SENTENCE.search(plain):
+        # a link farm: "Pagina principale / Ultime modifiche / Una voce a caso"
+        return True
+    bullets = sum(1 for line in stripped.splitlines()
+                  if line.lstrip().startswith(_LIST_MARKS[:3]))
+    if bullets and not _SENTENCE.search(plain):
+        # a menu drawn as a bullet list inside one block, with no prose in it
+        # ("* Rust * Install * Learn * Tools * Governance * Community")
+        return bullets >= 2 or len(plain) < 120
+    if len(plain) < 60 and not stripped.startswith("#") and not _SENTENCE.search(plain):
+        # a stray label ("Ricerca", "Aspetto") — a heading keeps its '#'
+        return True
+    return False
+
+
+def _readable(text):
+    """Keep the article: drop the chrome above it and the link farms inside it.
+
+    Heuristic on markdown, no HTML parsing: the article starts at the first block
+    that is not a menu label or a link farm, and those blocks are dropped
+    everywhere after it. Anything that does not look like a page (JSON, an array
+    of JSON objects) is returned untouched: a wrong guess must never eat the
+    answer, and a page that starts with a link is a page.
+    """
+    head = text.lstrip()[:2]
+    if head.startswith("{") or head in ('["', "[{"):
+        return text
+    blocks = _BLOCKS.split(text)
+    for start, block in enumerate(blocks):
+        if not _is_chrome(block):
+            break
+    else:
+        return text
+    kept = [b.strip() for b in blocks[start:] if not _is_chrome(b)]
+    # a heading with nothing under it is still chrome (docs sidebars: "Table of
+    # Contents", "Previous topic", "Next topic", "This page")
+    while kept and "\n" not in kept[0] and kept[0].startswith("#"):
+        kept.pop(0)
+    out = "\n\n".join(kept).strip()
+    return out if len(out) >= URL_READ_MIN_KEEP else text
+
+
+def _flatten_links(text):
+    """`[Gerry Scotti](https://it.wikipedia.org/wiki/...)` -> `Gerry Scotti`.
+
+    On a Wikipedia article more than half the characters are hrefs and tooltips:
+    they cost tokens on every later turn and tell the model nothing it needs to
+    answer. The page URL is already the tool argument, so nothing is lost.
+    """
+    text = _MD_IMAGE.sub(" ", text)
+    text = _MD_LINK.sub(lambda m: m.group(1), text)
+    # Wikipedia citations: `[\[1\]](#cite_note-...)` -> `[1]`
+    text = _CITATION.sub(lambda m: "[%s]" % m.group(1), text)
+    # leftover markdown escapes: `2006\.` -> `2006.`
+    text = _ESCAPES.sub(lambda m: m.group(1), text)
+    return re.sub(r"[ \t]+\n", "\n", text)
+
+
+def _truncate(text, want):
+    """Cut at `want` characters, preferring a sentence or line boundary."""
+    cut = text[:want]
+    edge = max(cut.rfind(". "), cut.rfind("\n"))
+    if edge > want - 300:
+        cut = cut[:edge + 1]
+    return cut.rstrip()
+
+
+_URL_READ_STATE = threading.local()
+
+
+def _adapt_url_read(arguments):
+    """Ask upstream for the whole page; the formatter keeps the article.
+
+    `section`, `readHeadings` and `paragraphRange` are targeted slices the model
+    asked for explicitly: those pass through untouched (and uncleaned) because
+    the filtering is already done upstream.
+    """
+    args = dict(arguments)
+    if any(args.get(k) for k in ("section", "readHeadings", "paragraphRange")):
+        _URL_READ_STATE.clean = False
+        _URL_READ_STATE.want = 0
+        return args
+    try:
+        want = int(args.get("maxLength") or URL_READ_DEFAULT)
+    except (TypeError, ValueError):
+        want = URL_READ_DEFAULT
+    _URL_READ_STATE.clean = True
+    _URL_READ_STATE.want = max(1, want)
+    if want < URL_READ_WINDOW:
+        args["maxLength"] = URL_READ_WINDOW
+    return args
+
+
+def _flat_url_read(result):
+    """Clean the page and cut it to the size the caller asked for."""
+    if result.get("isError"):
+        return result
+    try:
+        text = result["content"][0]["text"]
+        if not isinstance(text, str) or not text.strip():
+            return result
+    except Exception:
+        return result
+    if getattr(_URL_READ_STATE, "clean", False):
+        text = _flatten_links(_readable(text))
+    want = getattr(_URL_READ_STATE, "want", 0)
+    if want and len(text) > want:
+        text = _truncate(text, want)
+    return _text_result(text)
+
+
 FLAT_FORMATTERS = {"web_search": _flat_web_search,
+                   "web_url_read": _flat_url_read,
                    "chroma_query_documents": _flat_memory}
 
 
@@ -1329,7 +1494,8 @@ def _adapt_memory(arguments):
     return out
 
 
-FLAT_ADAPTERS = {"chroma_query_documents": _adapt_memory}
+FLAT_ADAPTERS = {"chroma_query_documents": _adapt_memory,
+                 "web_url_read": _adapt_url_read}
 
 
 def _text_result(text, is_error=False):
