@@ -75,8 +75,8 @@ small machine:
 
 `tools/list` answers with exactly two tools when no flat tools are configured
 (**1,870 chars, ~467 tokens** on the 109-tool catalogue, capability map included;
-~1,260 chars / ~315 tokens without it) — this deployment advertises six flat
-tools alongside them, see the next section:
+~1,260 chars / ~315 tokens without it) — this deployment advertises eight
+flat tools alongside them, see the next section:
 
 | Tool | What it does |
 |---|---|
@@ -99,9 +99,15 @@ proven it invents things (`chatId`, `freshness`, `site`, `collection_name`).
 | `web_url_read` | asks upstream for a 60 k window, keeps the article, cuts to the caller's size (menus and link farms stripped — see `_readable`) |
 | `search_and_read` | **the proxy's own tool**: runs `web_search`, reads the top hit, returns the article plus the other results as one line each — one model hop where search-then-read costs two. Never returns empty: a failed read falls back to the snippets and says so |
 | `send_message` / `read_image` / `chroma_query_documents` | one fixed Telegram chat; the Chroma collection comes from `MCP_LITE_MEMORY_COLLECTION`, not from the model |
+| `terminal_run` / `terminal_file` | **the proxy's own**: a shell and text-file read/write on the media host, over the Open Terminal REST API. Open WebUI's own terminal attachment is 22 tools / 17.6 kB / **4,619 tokens** on every turn; these two are **1,609 chars / 422 tokens**. Commands run in the `open-terminal` container (uid 1000, cwd `/home/user`, no docker socket), which this proxy reaches on the external network `open-terminal-net` |
 
-Surface as shipped (measured, `tools/list` on `:8814`): **8 tools, 5,442 chars of
-schema** — ~1,450 tokens, paid once per conversation by the prefix cache. The
+Surface as shipped (measured, `tools/list` on `:8814`): **10 tools, 7,055 chars
+of schema** — **1,831 tokens** (`cl100k_base`; 1,413 before the two terminal
+tools), paid once per conversation by the prefix cache. The terminal output is
+cut at `MCP_LITE_TERMINAL_OUTPUT` (1,400) chars, head and tail, with an explicit
+"… not shown: rerun a narrower command" marker — just under the router's
+`TOOL_RESULT_MAX_CHARS`, so a result shaped here is not cut again downstream
+without a clue. The
 rendering budgets are `MCP_LITE_FLAT_AUTO_DESC` / `MCP_LITE_FLAT_PARAM_DESC`, the
 answer shapes `MCP_LITE_FLAT_MAX_RESULTS` / `MCP_LITE_FLAT_SNIPPET` (this
 deployment: 5 × 500) and, for memory only, `MCP_LITE_MEMORY_MAX_RESULTS` /
@@ -233,6 +239,11 @@ them.
 | `MCP_LITE_MEMORY_MAX_RESULTS` / `MCP_LITE_MEMORY_SNIPPET` | `4` / `600` | shape of a `chroma_query_documents` answer, kept separate on purpose |
 | `MCP_LITE_FLAT_AUTO_DESC` / `MCP_LITE_FLAT_PARAM_DESC` | `200` / `90` | budgets of a derived flat description/param; hand-written specs are not cut |
 | `MCP_LITE_MEMORY_COLLECTION` | none | collection the flat `chroma_query_documents` reads (the model cannot guess it) |
+| `MCP_LITE_TERMINAL_URL` | none | Open Terminal REST base URL; **empty is the kill switch**: `terminal_run`/`terminal_file` drop out of the surface (here: `http://open-terminal:8000`, shared network `open-terminal-net`) |
+| `MCP_LITE_TERMINAL_KEY` | none | bearer for that API, from `.env` (`OPEN_TERMINAL_API_KEY`) — never written in the compose file |
+| `MCP_LITE_TERMINAL_WAIT` / `_WAIT_MAX` | `30` / `120` | seconds a `terminal_run` call waits before answering "still running" with a `process_id` to poll |
+| `MCP_LITE_TERMINAL_TIMEOUT` | `60` | HTTP timeout of the calls that return at once (file read/write) |
+| `MCP_LITE_TERMINAL_OUTPUT` | `1400` | characters of command output / file text kept |
 
 `manage-docker` restarts the service on its own when `tools-lite/proxy.py` is
 newer than the running container (the image is a plain `python:3.12-alpine`, so

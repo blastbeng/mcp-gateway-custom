@@ -633,7 +633,7 @@ services:
       # hand-written minimal schemas (search_and_read is the proxy's own: it
       # runs the other two); the rest get a compact one derived from the
       # catalogue.
-      MCP_LITE_FLAT_TOOLS: "web_search,web_url_read,search_and_read,send_message,read_image,chroma_query_documents"
+      MCP_LITE_FLAT_TOOLS: "web_search,web_url_read,search_and_read,send_message,read_image,chroma_query_documents,terminal_run,terminal_file"
       # Measured on Open WebUI chat 0407eb2f ("cerca sul web chi è Gerry Scotti",
       # 252 s and six model hops): a 300-char snippet of the Wikipedia lead was
       # cut before the fact asked for, so the model opened the page anyway.
@@ -644,6 +644,15 @@ services:
       # The flat chroma tool takes `query` only: the model cannot guess a
       # collection name, so the deployment supplies it.
       MCP_LITE_MEMORY_COLLECTION: "aiderdesk_cheap-llm-stack_memory"
+      # Terminal: the Open Terminal REST API of the media host (the same
+      # container Open WebUI's terminal panel uses), as TWO flat tools
+      # instead of the 22-tool / ~4.6k-token surface Open WebUI attaches to a
+      # model. Reachability is the external network open-terminal-net; the key
+      # is the same value the openwebui compose uses, read from .env (this
+      # file never carries a secret). Empty MCP_LITE_TERMINAL_URL = kill
+      # switch: the two tools disappear from the surface.
+      MCP_LITE_TERMINAL_URL: "http://open-terminal:8000"
+      MCP_LITE_TERMINAL_KEY: ${OPEN_TERMINAL_API_KEY:-}
     ports:
       - "8814:8814"
     extra_hosts:
@@ -664,6 +673,12 @@ services:
       - mcp-gateway
     networks:
       - mcp
+      # The media host's open-terminal container is not on ai-mcp (it belongs
+      # to the openwebui compose), so the two projects share this external
+      # network instead of a published port: nothing new is exposed on the
+      # host, and the terminal API stays reachable only by these containers.
+      # Created once, by hand: docker network create open-terminal-net
+      - open-terminal-net
 
 volumes:
 
@@ -680,3 +695,8 @@ networks:
   mcp:
     name: ai-mcp
     driver: bridge
+
+  # Shared with /opt/docker/compose/openwebui (open-terminal service): it
+  # exists in neither project, so it is declared external in both.
+  open-terminal-net:
+    external: true

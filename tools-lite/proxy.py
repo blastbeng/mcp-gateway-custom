@@ -86,6 +86,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -295,12 +296,95 @@ FLAT_SPECS = {
             "required": ["query"],
         },
     },
+    # terminal_run / terminal_file: this proxy's own tools over the Open
+    # Terminal REST API (handlers at the bottom of the flat section). The
+    # description says what the machine IS, because "run a command" alone gets
+    # the model to guess paths and shells.
+    #
+    # `required` is empty on terminal_run on purpose: the same tool also reads
+    # the output of a command started earlier (process_id), and a schema that
+    # demands `command` makes the model invent one when it only wants to poll.
+    # The handler refuses a call with neither and says what is missing.
+    "terminal_run": {
+        "description": ("Run a shell command on the Linux machine that hosts this stack "
+                        "(sh, user 1000, cwd /home/user) and return its output and exit "
+                        "code: inspect files, run scripts, check a service. A command "
+                        "still running after `wait` seconds keeps going - call again with "
+                        "its process_id to read the new output."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string",
+                            "description": "shell command, e.g. 'ls -la /opt && df -h'"},
+                "cwd": {"type": "string",
+                        "description": "working directory (default /home/user)"},
+                "wait": {"type": "integer",
+                         "description": "seconds to wait for it to end (default 30, max 120)"},
+                "process_id": {"type": "string",
+                               "description": "read a command started earlier instead of running one"},
+                "offset": {"type": "integer",
+                           "description": "output entries already read (with process_id)"},
+            },
+            "required": [],
+        },
+    },
+    "terminal_file": {
+        "description": ("Read or write a text file on the Linux machine that hosts this "
+                        "stack. read returns the text (start_line/end_line select a range); "
+                        "write overwrites the file and creates the parent directories."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["read", "write"],
+                           "description": "read or write"},
+                "path": {"type": "string",
+                         "description": "absolute path, or relative to /home/user"},
+                "content": {"type": "string",
+                            "description": "text to write (action=write)"},
+                "start_line": {"type": "integer",
+                               "description": "first line to read (1-based)"},
+                "end_line": {"type": "integer",
+                             "description": "last line to read (1-based)"},
+            },
+            "required": ["action", "path"],
+        },
+    },
 }
 
 # Collection the flat `chroma_query_documents` reads. Set per deployment: the
 # cheap surface serves one project, and its collection name is the one thing the
 # model cannot guess.
 MEMORY_COLLECTION = os.environ.get("MCP_LITE_MEMORY_COLLECTION", "")
+
+# --------------------------------------------------------------------------
+# terminal: two flat tools over the Open Terminal REST API
+# --------------------------------------------------------------------------
+# Open WebUI can attach its own terminal to a model, but it pays for it exactly
+# where this stack cannot: that surface is 22 tools / 17.6k chars of schema /
+# ~4.6k tokens, and the tools block sits at the START of the prompt, so it is
+# re-sent on every turn and re-prefilled on the cheap node.
+#
+# Two flat tools over the same REST API cost ~420 tokens instead. Nothing new
+# runs: the commands execute in the container Open WebUI's own terminal panel
+# uses (uid 1000, cwd /home/user, no docker socket, only that container's
+# binds), and this proxy only holds the bearer key and forwards. The renderers
+# below cut the output HERE, with a marker that says how to get the rest: a
+# generic cap downstream would cut it without a clue.
+#
+# MCP_LITE_TERMINAL_URL empty is the kill switch: the two tools then drop out
+# of the surface completely (they must not be advertised and then fail - the
+# surface is also what the prefix cache is keyed on).
+TERMINAL_URL = os.environ.get("MCP_LITE_TERMINAL_URL", "").strip().rstrip("/")
+TERMINAL_KEY = os.environ.get("MCP_LITE_TERMINAL_KEY", "")
+# HTTP timeout for the calls that return at once (file read/write); a command
+# adds its own `wait` on top, so the socket never closes under it.
+TERMINAL_TIMEOUT = float(os.environ.get("MCP_LITE_TERMINAL_TIMEOUT", "60"))
+TERMINAL_WAIT_DEFAULT = float(os.environ.get("MCP_LITE_TERMINAL_WAIT", "30"))
+TERMINAL_WAIT_MAX = float(os.environ.get("MCP_LITE_TERMINAL_WAIT_MAX", "120"))
+# 1400, just under the router's TOOL_RESULT_MAX_CHARS (1500): a result this
+# proxy has already shaped is not cut a second time on the way to the model.
+TERMINAL_MAX_OUTPUT = int(os.environ.get("MCP_LITE_TERMINAL_OUTPUT", "1400"))
+TERMINAL_TOOLS = ("terminal_run", "terminal_file")
 
 
 def log(msg):
@@ -1284,6 +1368,9 @@ def flat_tools():
     """
     out = []
     for name in FLAT_TOOLS:
+        if name in TERMINAL_TOOLS and not TERMINAL_URL:
+            log("flat tool %r disabled: MCP_LITE_TERMINAL_URL is empty" % name)
+            continue
         tool = CATALOG.by_name.get(name)
         if tool is None and name not in PROXY_TOOLS:
             log("flat tool %r is not in the catalogue, skipping" % name)
@@ -1543,6 +1630,10 @@ def _text_result(text, is_error=False):
 def _run_tool(name, arguments):
     """Execute a real tool on its upstream; return the raw MCP result."""
     tool = CATALOG.by_name.get(name)
+    if tool is None and name in PROXY_HANDLERS:
+        # Not in the catalogue, but on this same surface: `run_tool` aimed at
+        # one of the proxy's own tools must not dead-end in "unknown tool".
+        return PROXY_HANDLERS[name](arguments)
     if tool is None:
         sugg = CATALOG.search(name, k=3)
         names = [m["name"] for m in sugg.get("matched", [])]
@@ -1632,12 +1723,176 @@ def _search_and_read(arguments):
     return _text_result("\n".join(lines))
 
 
+def _terminal_call(path, payload=None, timeout=None):
+    """One request to the Open Terminal REST API; the decoded JSON reply.
+
+    A `detail` from FastAPI is what the model needs to read (a wrong path, a
+    401), not the Python exception: it is unwrapped here and every failure is
+    an RpcError, so it reaches the client as a tool error and not as a 500.
+    """
+    if not TERMINAL_URL:
+        raise RpcError("the terminal is not configured on this proxy")
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(TERMINAL_URL + path, data=data,
+                                 method="POST" if data is not None else "GET")
+    req.add_header("Accept", "application/json")
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    if TERMINAL_KEY:
+        req.add_header("Authorization", "Bearer " + TERMINAL_KEY)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout or TERMINAL_TIMEOUT + 15) as resp:
+            ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            body = resp.read()
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")
+        try:
+            detail = json.loads(detail).get("detail") or detail
+        except Exception:
+            pass
+        raise RpcError("terminal: HTTP %s %s"
+                       % (exc.code, " ".join(str(detail).split())[:200]))
+    except Exception as exc:
+        raise RpcError("terminal unreachable at %s: %s" % (TERMINAL_URL, exc))
+    try:
+        return json.loads(body)
+    except Exception:
+        # /files/read answers an image as bytes: that is not a text file, and
+        # the model must be told so instead of being handed a mojibake blob.
+        raise RpcError("the terminal answered %s: not a text file"
+                       % (ctype or "an unknown content type"))
+
+
+def _terminal_wait(value, default=TERMINAL_WAIT_DEFAULT):
+    """`wait` in seconds, clamped: a model sends 0, "30", or nothing at all."""
+    try:
+        wait = float(value)
+    except (TypeError, ValueError):
+        wait = float(default)
+    return max(0.0, min(TERMINAL_WAIT_MAX, wait))
+
+
+def _terminal_output(data):
+    """The process log as text: PTY newlines normalised, no trailing blank."""
+    parts = []
+    for rec in data.get("output") or []:
+        if isinstance(rec, dict):
+            parts.append(str(rec.get("data") or ""))
+    return "".join(parts).replace("\r\n", "\n").replace("\r", "\n").rstrip("\n")
+
+
+def _terminal_cut(text, hint):
+    """Keep the head and more of the tail, and say exactly what was dropped.
+
+    The tail carries the error, so it keeps the larger share; the marker names
+    the way to get the rest, because a bare "..." reads like the end of the
+    output and the model answers from half a log.
+    """
+    if len(text) <= TERMINAL_MAX_OUTPUT:
+        return text
+    marker = "\n[... %d characters not shown: %s]\n"
+    room = max(200, TERMINAL_MAX_OUTPUT - len(marker % (len(text), hint)))
+    head = room // 3
+    tail = room - head
+    return text[:head] + (marker % (len(text) - head - tail, hint)) + text[-tail:]
+
+
+def _terminal_run(arguments):
+    """Run a command, or read the output of one already running.
+
+    One tool instead of two: the follow-up call is how a long command reports
+    its progress, and a model that has just been handed a process_id should not
+    have to learn a second schema to use it.
+    """
+    process_id = str(arguments.get("process_id") or "").strip()
+    if process_id:
+        try:
+            offset = max(0, int(arguments.get("offset") or 0))
+        except (TypeError, ValueError):
+            offset = 0
+        wait = _terminal_wait(arguments.get("wait"), 10)
+        data = _terminal_call("/execute/%s/status?offset=%d&wait=%g"
+                              % (urllib.parse.quote(process_id, safe=""), offset, wait),
+                              timeout=wait + 20)
+    else:
+        command = str(arguments.get("command") or "").strip()
+        if not command:
+            raise RpcError("terminal_run needs a 'command', or the 'process_id' of a "
+                           "command started before")
+        wait = _terminal_wait(arguments.get("wait"))
+        payload = {"command": command}
+        cwd = str(arguments.get("cwd") or "").strip()
+        if cwd:
+            payload["cwd"] = cwd
+        data = _terminal_call("/execute?wait=%g" % wait, payload, timeout=wait + 20)
+
+    status = str(data.get("status") or "?")
+    code = data.get("exit_code")
+    if status == "running":
+        head = "still running after %gs (process_id %s, next offset %s)" % (
+            wait, data.get("id") or process_id, data.get("next_offset", 0))
+    else:
+        head = "%s, exit %s" % (status, "?" if code is None else code)
+    out = _terminal_output(data)
+    if not out:
+        return _text_result(head + ("\n(no output yet)" if status == "running" else ""))
+    return _text_result(head + "\n" + _terminal_cut(
+        out, "rerun a narrower command (grep, head, tail) to see the rest"))
+
+
+def _terminal_file(arguments):
+    """Read or write one text file, through the same API the panel uses."""
+    action = str(arguments.get("action") or "read").strip().lower()
+    path = str(arguments.get("path") or "").strip()
+    if action not in ("read", "write"):
+        raise RpcError("terminal_file action must be 'read' or 'write'")
+    if not path:
+        raise RpcError("terminal_file needs a 'path'")
+    if action == "write":
+        content = arguments.get("content")
+        if content is None:
+            raise RpcError("terminal_file action=write needs 'content'")
+        content = str(content)
+        data = _terminal_call("/files/write", {"path": path, "content": content})
+        return _text_result("wrote %s bytes to %s"
+                            % (data.get("size", len(content.encode())),
+                               data.get("path") or path))
+    query, asked = ["path=" + urllib.parse.quote(path)], {}
+    for key in ("start_line", "end_line"):
+        value = arguments.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            asked[key] = max(1, int(value))
+            query.append("%s=%d" % (key, asked[key]))
+        except (TypeError, ValueError):
+            pass
+    data = _terminal_call("/files/read?" + "&".join(query))
+    total = data.get("total_lines")
+    head = data.get("path") or path
+    if total:
+        if asked:
+            # Say the slice out loud: a model handed 20 lines of a 1400-line log
+            # otherwise believes it read the whole file.
+            head += " (lines %s-%s of %s)" % (asked.get("start_line", 1),
+                                              asked.get("end_line", total), total)
+        else:
+            head += " (%s line%s)" % (total, "" if total == 1 else "s")
+    text = str(data.get("content") or "")
+    if not text.strip():
+        return _text_result(head + "\n(the file is empty)")
+    return _text_result(head + "\n" + _terminal_cut(
+        text, "read the rest with start_line/end_line"))
+
+
 # Tools this proxy implements itself instead of forwarding: the schema is the
-# hand-written one in FLAT_SPECS, the handler runs the real tools above. They
-# are advertised on the flat surface, so `flat_tools` must not drop them for
-# being absent from the catalogue.
-PROXY_TOOLS = {"search_and_read"}
-PROXY_HANDLERS = {"search_and_read": _search_and_read}
+# hand-written one in FLAT_SPECS, the handler runs the real tools above (or
+# talks to the terminal API). They are advertised on the flat surface, so
+# `flat_tools` must not drop them for being absent from the catalogue.
+PROXY_TOOLS = {"search_and_read", "terminal_run", "terminal_file"}
+PROXY_HANDLERS = {"search_and_read": _search_and_read,
+                  "terminal_run": _terminal_run,
+                  "terminal_file": _terminal_file}
 
 
 def handle_tool_call(name, arguments):
